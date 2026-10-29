@@ -1,4 +1,4 @@
-"""Isaac Sim windows for the environment camera and the perception overlay."""
+"""Isaac Sim windows for the wrist camera and the perception overlay."""
 
 from __future__ import annotations
 
@@ -8,17 +8,23 @@ from pseudo_vla.perception import compose_overlay
 
 
 class PerceptionWindows:
-    """A viewport locked to the environment camera, plus the SAM and CoTracker image."""
+    """A viewport locked to the wrist camera, plus the SAM and CoTracker image."""
 
-    def __init__(self, camera_path: str, resolution: tuple[int, int]) -> None:
+    def __init__(
+        self,
+        wrist_camera_path: str,
+        wrist_resolution: tuple[int, int],
+        overlay_resolution: tuple[int, int],
+    ) -> None:
         import omni.ui as ui
         from isaacsim.core.rendering_manager import ViewportManager
 
-        width, height = resolution
+        width, height = wrist_resolution
+        overlay_width, overlay_height = overlay_resolution
         self.viewport = ViewportManager.create_viewport_window(
-            camera=camera_path,
-            title="Environment Camera",
-            resolution=resolution,
+            camera=wrist_camera_path,
+            title="Wrist Camera",
+            resolution=wrist_resolution,
         )
         self.viewport.position_x = 40
         self.viewport.position_y = 80
@@ -26,7 +32,7 @@ class PerceptionWindows:
         self.viewport.height = height
 
         self._provider = ui.ByteImageProvider()
-        self.window = ui.Window("SAM + CoTracker", width=width + 16, height=height + 16)
+        self.window = ui.Window("SAM + CoTracker", width=overlay_width + 16, height=overlay_height + 16)
         self.window.position_x = 64 + width
         self.window.position_y = 80
         with self.window.frame:

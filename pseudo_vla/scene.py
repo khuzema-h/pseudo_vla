@@ -23,38 +23,10 @@ ENV_CAMERA_EYE = np.array([1.05, -0.70, 0.95], dtype=np.float64)
 ENV_CAMERA_TARGET = np.array([0.55, 0.0, TABLE_TOP_Z], dtype=np.float64)
 ENV_RESOLUTION = (480, 480)
 WRIST_RESOLUTION = (256, 256)
-# Local pose of the wrist camera on panda_hand. The quaternion is the ROS optical
-# frame used by Isaac Lab; it is converted to the USD camera frame when authored.
-WRIST_TRANSLATION = (0.13, 0.0, -0.15)
-WRIST_ROS_QUAT_WXYZ = (-0.70614, 0.03701, 0.03701, -0.70614)
-
-
-def _quat_multiply(
-    a: tuple[float, float, float, float],
-    b: tuple[float, float, float, float],
-) -> tuple[float, float, float, float]:
-    aw, ax, ay, az = a
-    bw, bx, by, bz = b
-    return (
-        aw * bw - ax * bx - ay * by - az * bz,
-        aw * bx + ax * bw + ay * bz - az * by,
-        aw * by - ax * bz + ay * bw + az * bx,
-        aw * bz + ax * by - ay * bx + az * bw,
-    )
-
-
-def _wrist_mount() -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
-    """Swing the wrist camera 90 degrees counterclockwise about the gripper axis."""
-    # Positive rotation about panda_hand +Z, which points along the gripper.
-    turn = (float(np.cos(np.pi / 4.0)), 0.0, 0.0, float(np.sin(np.pi / 4.0)))
-    x, y, z = WRIST_TRANSLATION
-    translation = (-y, x, z)
-    quat = np.asarray(_quat_multiply(turn, WRIST_ROS_QUAT_WXYZ), dtype=np.float64)
-    quat = quat / np.linalg.norm(quat)
-    return translation, (float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3]))
-
-
-WRIST_MOUNTED_TRANSLATION, WRIST_MOUNTED_QUAT_WXYZ = _wrist_mount()
+# Pose on panda_hand. Offset to the side of the palm and pitched down the fingers
+# so the open gap, not the back of the hand, is in frame. Fingertips are near z=0.11.
+WRIST_EYE = np.array([0.12, 0.0, 0.03], dtype=np.float64)
+WRIST_LOOK_TARGET = np.array([0.0, 0.0, 0.13], dtype=np.float64)
 HOME_ARM = {
     "panda_joint1": 0.0,
     "panda_joint2": -1.3,
@@ -209,6 +181,40 @@ def _ensure_physics_scene() -> None:
         PhysxSchema.PhysxSceneAPI.Apply(stage.GetPrimAtPath(path))
 
 
+def _add_camera_marker(camera_path: str, color: tuple[float, float, float], size: float) -> None:
+    """A body and lens sitting behind the camera, so the camera itself is visible in the stage.
+
+    USD cameras look down their local -Z, so +Z is behind the lens and stays out of that camera's image.
+    """
+    import omni.usd
+    from pxr import Gf, UsdGeom
+
+    stage = omni.usd.get_context().get_stage()
+    body = UsdGeom.Cube.Define(stage, camera_path + "/body")
+    body.CreateSizeAttr(1.0)
+    body.CreateDisplayColorAttr([color])
+    body.CreateDoubleSidedAttr(True)
+    body_xform = UsdGeom.Xformable(body.GetPrim())
+    body_xform.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, size))
+    body_xform.AddScaleOp().Set(Gf.Vec3d(size, size * 0.72, size * 0.55))
+
+    lens = UsdGeom.Cone.Define(stage, camera_path + "/lens")
+    lens.CreateRadiusAttr(size * 0.38)
+    lens.CreateHeightAttr(size * 0.9)
+    lens.CreateAxisAttr("Z")
+    lens.CreateDisplayColorAttr([color])
+    lens.CreateDoubleSidedAttr(True)
+    lens_xform = UsdGeom.Xformable(lens.GetPrim())
+    lens_xform.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, size * 0.45))
+    lens_xform.AddRotateXOp().Set(180.0)
+
+
+def _show_camera_gizmos() -> None:
+    import carb
+
+    carb.settings.get_settings().set("/app/viewport/show/camera", True)
+
+
 def _author_camera_pose(camera_path: str, translation: tuple[float, float, float], quat_wxyz: tuple[float, float, float, float]) -> None:
     import omni.usd
     from pxr import Gf, UsdGeom
@@ -227,9 +233,21 @@ def _author_camera_pose(camera_path: str, translation: tuple[float, float, float
     orient.Set(Gf.Quatd(quat_wxyz[0], Gf.Vec3d(quat_wxyz[1], quat_wxyz[2], quat_wxyz[3])))
 
 
+def _ros_look_at_wxyz(eye: np.ndarray, target: np.ndarray, right_hint: np.ndarray) -> np.ndarray:
+    """ROS optical orientation (wxyz). +Z looks at the target and +X follows the right hint."""
+    forward = target - eye
+    z_axis = forward / np.linalg.norm(forward)
+    x_axis = right_hint - z_axis * float(np.dot(right_hint, z_axis))
+    x_axis = x_axis / np.linalg.norm(x_axis)
+    y_axis = np.cross(z_axis, x_axis)
+    return _matrix_to_quat_wxyz(np.stack([x_axis, y_axis, z_axis], axis=1))
+
+
 def _author_wrist_camera(camera_path: str) -> None:
-    quat = _ros_optical_to_usd(WRIST_MOUNTED_QUAT_WXYZ)
-    _author_camera_pose(camera_path, WRIST_MOUNTED_TRANSLATION, tuple(float(value) for value in quat))
+    # Hand +Y is the finger opening, so the two fingers fall on the left and right of the image.
+    quat = _ros_look_at_wxyz(WRIST_EYE, WRIST_LOOK_TARGET, np.array([0.0, 1.0, 0.0]))
+    usd_quat = _ros_optical_to_usd(tuple(float(value) for value in quat))
+    _author_camera_pose(camera_path, tuple(float(value) for value in WRIST_EYE), usd_quat)
 
 
 def _matrix_to_quat_wxyz(rotation: np.ndarray) -> np.ndarray:
@@ -354,11 +372,12 @@ def build_scene(app) -> FrankaScene:
     base_path = _find_prim_path(stage, "panda_link0")
     wrist_camera_path = hand_path + "/wrist_cam"
     wrist = Camera(wrist_camera_path)
-    wrist.set_focal_lengths([24.0])
+    wrist.set_focal_lengths([16.0])
     wrist.set_apertures(horizontal_apertures=[20.955], vertical_apertures=[15.2908])
-    wrist.set_clipping_ranges(near_distances=[0.05], far_distances=[2.0])
+    wrist.set_clipping_ranges(near_distances=[0.02], far_distances=[2.0])
     _author_wrist_camera(wrist_camera_path)
-    _log(f"wrist camera local pose {WRIST_MOUNTED_TRANSLATION}")
+    _add_camera_marker(wrist_camera_path, (0.95, 0.45, 0.08), 0.028)
+    _log(f"wrist camera eye {WRIST_EYE.tolist()} looking at {WRIST_LOOK_TARGET.tolist()}")
 
     env_camera = Camera(ENV_CAMERA_PATH)
     env_camera.set_focal_lengths([18.0])
@@ -366,6 +385,7 @@ def build_scene(app) -> FrankaScene:
     env_camera.set_clipping_ranges(near_distances=[0.05], far_distances=[5.0])
     env_quat = _look_at_wxyz(ENV_CAMERA_EYE, ENV_CAMERA_TARGET)
     _author_camera_pose(ENV_CAMERA_PATH, tuple(float(value) for value in ENV_CAMERA_EYE), tuple(float(value) for value in env_quat))
+    _add_camera_marker(ENV_CAMERA_PATH, (0.15, 0.75, 0.95), 0.06)
 
     scene_arm = Articulation("/World/Arm")
     app_utils.play()
@@ -395,5 +415,6 @@ def build_scene(app) -> FrankaScene:
     _log("home pose set")
     for _ in range(20):
         scene.step()
+    _show_camera_gizmos()
     _log("scene ready")
     return scene

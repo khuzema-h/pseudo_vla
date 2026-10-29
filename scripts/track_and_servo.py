@@ -80,11 +80,11 @@ def run(app, args: argparse.Namespace) -> None:
 
         view = None
         if not args.headless:
-            from pseudo_vla.scene import ENV_CAMERA_PATH, ENV_RESOLUTION
+            from pseudo_vla.scene import ENV_RESOLUTION, WRIST_RESOLUTION
             from pseudo_vla.view import PerceptionWindows
 
-            view = PerceptionWindows(ENV_CAMERA_PATH, ENV_RESOLUTION)
-            say("opened Environment Camera and SAM + CoTracker windows")
+            view = PerceptionWindows(scene.wrist_camera_path, WRIST_RESOLUTION, ENV_RESOLUTION)
+            say("opened Wrist Camera and SAM + CoTracker windows")
 
         say("Type anything for SAM, such as \"red cube\" or \"blue cylinder\".")
         say("Two numbers are a pixel. Four numbers are a box.")
