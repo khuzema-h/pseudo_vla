@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+.env
+.env.*
+
+# Editors
+.vscode/
+.idea/
+.DS_Store
+
+# Run artifacts
+outputs/
+*.log
+
+# Model weights
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Third-party clone (has its own git repo)
+segment-anything-2/

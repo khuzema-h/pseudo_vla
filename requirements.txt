@@ -1,0 +1,16 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+--extra-index-url https://pypi.nvidia.com
+
+torch
+torchvision
+torchaudio
+imageio
+imageio-ffmpeg
+einops
+timm
+matplotlib
+scipy
+isaacsim[all,extscache]==6.2.0.0
+cuda-core[cu12]
+git+https://github.com/facebookresearch/co-tracker.git
+transformers>=4.46,<5
