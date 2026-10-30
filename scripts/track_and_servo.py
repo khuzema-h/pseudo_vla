@@ -26,6 +26,7 @@ HOME_DISTANCE = 0.02
 GRIPPER_FINGER_REACH = 0.11
 GRIPPER_SETTLE_STEPS = 45
 LIFT_HEIGHT = 0.20
+STACK_TRANSIT_CLEARANCE = 0.15
 QUIT_COMMANDS = {"quit", "exit", "q"}
 
 
@@ -185,7 +186,14 @@ def _move_to_prompt(scene, perception, servo, prompt, commands, max_steps: int, 
             point, box = _prompt_to_sam(perception, rgb, prompt, say)
             if point is None and box is None:
                 return None
-            queries = perception.segment(rgb, point, box)
+            tracked_group = _tracked_prompt_group(perception, prompt)
+            if tracked_group is None:
+                queries = perception.segment(rgb, point, box)
+            else:
+                group_name, _ = tracked_group
+                queries = perception.segment_groups(
+                    rgb, {group_name: (point, box)}
+                )[group_name]
             save_overlay(ROOT / "outputs" / "frame0_overlay.png", rgb, perception.mask, queries)
             _update_camera_views(scene, view, rgb, depth, perception.mask, queries)
             say(f"SAM 2 mask pixels {int(perception.mask.sum())}")
@@ -409,6 +417,7 @@ def _stack_tracked_cube(scene, perception, servo, support_name: str, moving_name
     moving_spec = specs[moving_name]
     moving_dims = object_dims(moving_spec)
     hover_goal = None
+    transit = moving_name == "green"
 
     say(f"approaching {moving_name} while tracking {support_name} as the placement target")
     servo.clear()
@@ -436,7 +445,11 @@ def _stack_tracked_cube(scene, perception, servo, support_name: str, moving_name
             else:
                 goal.center_world[2] = goal.top_z - moving_dims[2] / 2.0
                 hover_goal = goal
-                servo.update_goal(goal, scene.joint_positions())
+                plan_goal = goal
+                if transit:
+                    base_world, base_quat = prim_world_pose(scene.base_path)
+                    plan_goal = _stack_transit_goal(goal, base_world, base_quat)
+                servo.update_goal(plan_goal, scene.joint_positions())
                 log(
                     f"stack approach {moving_name} from CoTracker depth: "
                     f"center {goal.center_world.round(3).tolist()} top z {goal.top_z:.3f} "
@@ -457,13 +470,19 @@ def _stack_tracked_cube(scene, perception, servo, support_name: str, moving_name
         if hover_goal is None:
             continue
         height, horizontal = _gripper_place(scene, servo, hover_goal)
+        target_height = STANDOFF_Z + (STACK_TRANSIT_CLEARANCE if transit else 0.0)
         if step % 16 == 0:
             log(
                 f"stack hover {moving_name}: horizontal error {horizontal:.3f} m, "
-                f"height {height:.3f} m, target {STANDOFF_Z:.3f} m, "
-                f"height error {abs(height - STANDOFF_Z):.3f} m"
+                f"height {height:.3f} m, target {target_height:.3f} m, "
+                f"height error {abs(height - target_height):.3f} m"
             )
-        if horizontal <= APPROACH_TOLERANCE and abs(height - STANDOFF_Z) <= APPROACH_TOLERANCE:
+        if horizontal <= APPROACH_TOLERANCE and abs(height - target_height) <= APPROACH_TOLERANCE:
+            if transit:
+                transit = False
+                servo.update_goal(hover_goal, scene.joint_positions())
+                say(f"at safe approach height above {moving_name}; descending to the hover waypoint")
+                continue
             break
     else:
         say(f"could not reach the hover waypoint for {moving_name}")
@@ -628,6 +647,19 @@ def _stack_tracked_cube(scene, perception, servo, support_name: str, moving_name
         servo.update_block_positions(centers)
 
 
+def _stack_transit_goal(hover_goal, base_world: np.ndarray, base_quat: np.ndarray):
+    from pseudo_vla.perception import ApproachGoal, STANDOFF_Z, world_to_base
+
+    transit_world = hover_goal.center_world.copy()
+    transit_world[2] = hover_goal.top_z + STANDOFF_Z + STACK_TRANSIT_CLEARANCE
+    return ApproachGoal(
+        position=world_to_base(transit_world.reshape(1, 3), base_world, base_quat)[0],
+        quaternion=hover_goal.quaternion.copy(),
+        center_world=hover_goal.center_world.copy(),
+        top_z=hover_goal.top_z,
+    )
+
+
 def _stack_placement_goals(support_points: np.ndarray, moving_dims: np.ndarray, base_path: str):
     from pseudo_vla.perception import (
         ApproachGoal,
@@ -688,11 +720,40 @@ def _prompt_to_sam(perception, rgb: np.ndarray, prompt: str, say) -> tuple[tuple
     say(f"grounding \"{prompt}\"")
     found = perception.ground(rgb, prompt)
     if found is None:
+        tracked_group = _tracked_prompt_group(perception, prompt)
+        if tracked_group is not None:
+            group_name, point = tracked_group
+            say(
+                f"grounding found no match; reusing active CoTracker points "
+                f"for {group_name}"
+            )
+            return point, None
         say(f"nothing in the environment camera matched \"{prompt}\"")
         return None, None
     box, score = found
     say(f"SAM box {[round(value, 1) for value in box]} score {score:.2f}")
     return None, box
+
+
+def _tracked_prompt_group(perception, prompt: str):
+    prompt_words = prompt.lower().replace("_", " ").replace("-", " ").split()
+    query_groups = getattr(perception, "query_groups", {})
+    query_xy = getattr(perception, "query_xy", None)
+    if query_xy is None:
+        return None
+    for group_name, point_slice in query_groups.items():
+        group_words = group_name.lower().replace("_", " ").replace("-", " ").split()
+        if not group_words or not _contains_word_sequence(prompt_words, group_words):
+            continue
+        points = query_xy[point_slice]
+        if len(points):
+            center = np.median(points, axis=0)
+            return group_name, (float(center[0]), float(center[1]))
+    return None
+
+
+def _contains_word_sequence(words: list[str], sequence: list[str]) -> bool:
+    return any(words[index : index + len(sequence)] == sequence for index in range(len(words) - len(sequence) + 1))
 
 
 def _projected_cube_prompt(scene, rgb: np.ndarray, camera_params: dict, object_name: str, say):
@@ -720,7 +781,7 @@ def _seed_placed_cube_tracking(scene, perception, object_name: str, say, view) -
     scene.step()
     rgb, depth, camera_params = scene.read_sensors()
     point, _ = _projected_cube_prompt(scene, rgb, camera_params, object_name, say)
-    perception.segment_groups(rgb, {"placed": (point, None)})
+    perception.segment_groups(rgb, {object_name: (point, None)})
     say(f"dropped stale CoTracker points; tracking the placed {object_name} cube")
     _update_camera_views(scene, view, rgb, depth, perception.mask, perception.query_xy)
 

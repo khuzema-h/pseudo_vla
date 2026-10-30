@@ -184,6 +184,24 @@ class StackingPerceptionTests(unittest.TestCase):
         np.testing.assert_allclose(goal.position, [0.21, -0.29, 0.17])
         self.assertAlmostEqual(goal.top_z, 0.07)
 
+    def test_stack_transit_waypoint_preserves_xy_and_adds_clearance(self):
+        hover_goal = perception.ApproachGoal(
+            position=np.array([0.2, -0.3, 0.16]),
+            quaternion=np.array([0.0, 1.0, 0.0, 0.0]),
+            center_world=np.array([0.2, -0.3, 0.035]),
+            top_z=0.06,
+        )
+
+        transit_goal = track_and_servo._stack_transit_goal(
+            hover_goal,
+            np.zeros(3),
+            np.array([1.0, 0.0, 0.0, 0.0]),
+        )
+
+        np.testing.assert_allclose(transit_goal.position[:2], hover_goal.position[:2])
+        self.assertAlmostEqual(transit_goal.position[2], 0.06 + 0.10 + 0.15)
+        np.testing.assert_array_equal(transit_goal.quaternion, hover_goal.quaternion)
+
     def test_stack_cube_mask_prompt_uses_projected_scene_point(self):
         scene = SimpleNamespace(
             object_paths={"green_block": "/World/green"},
@@ -204,6 +222,26 @@ class StackingPerceptionTests(unittest.TestCase):
         np.testing.assert_allclose(project.call_args.args[0], [0.0, -0.28, 0.035])
         self.assertIn("seeding green SAM mask", messages[0])
 
+    def test_text_prompt_reuses_matching_active_tracker_group_if_grounding_fails(self):
+        image = np.zeros((32, 32, 3), dtype=np.uint8)
+        perception_instance = SimpleNamespace(
+            ground=lambda frame, prompt: None,
+            query_groups={"green": slice(0, 4)},
+            query_xy=np.array(
+                [[10.0, 12.0], [14.0, 12.0], [10.0, 16.0], [14.0, 16.0]],
+                dtype=np.float32,
+            ),
+        )
+        messages = []
+
+        point, box = track_and_servo._prompt_to_sam(
+            perception_instance, image, "green block", messages.append
+        )
+
+        self.assertEqual(point, (12.0, 14.0))
+        self.assertIsNone(box)
+        self.assertIn("reusing active CoTracker points for green", messages[-1])
+
     def test_completed_stack_reseeds_tracker_on_placed_green_cube(self):
         image = np.zeros((32, 32, 3), dtype=np.uint8)
         scene = SimpleNamespace(
@@ -215,7 +253,7 @@ class StackingPerceptionTests(unittest.TestCase):
         perception_instance = SimpleNamespace(
             mask=np.ones((32, 32), dtype=bool),
             query_xy=np.array([[16.0, 16.0]], dtype=np.float32),
-            segment_groups=lambda frame, prompts: self.assertEqual(set(prompts), {"placed"})
+            segment_groups=lambda frame, prompts: self.assertEqual(set(prompts), {"green"})
         )
         say = unittest.mock.Mock()
         view = SimpleNamespace(update=lambda *args, **kwargs: None)
