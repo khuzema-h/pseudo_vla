@@ -15,12 +15,12 @@ TABLE_CENTER = (TABLE_MIN + TABLE_MAX) / 2.0
 TABLE_TOP_Z = float(TABLE_MAX[2])
 # The arm stands on the near edge of the table and faces +Y, toward the props.
 ARM_POSITION = (0.0, -0.60, TABLE_TOP_Z + 0.002)
-# YCB props from the Isaac Props folder, in front of the base but close enough to reach.
+# Three grasp-sized blocks in front of the arm.
+BLOCK_SIZE = 0.05
 SCENE_OBJECTS = (
-    {"name": "cracker_box", "usd": "/Isaac/Props/YCB/Axis_Aligned_Physics/003_cracker_box.usd", "xy": (-0.25, -0.35)},
-    {"name": "sugar_box", "usd": "/Isaac/Props/YCB/Axis_Aligned_Physics/004_sugar_box.usd", "xy": (0.12, -0.25)},
-    {"name": "tomato_soup_can", "usd": "/Isaac/Props/YCB/Axis_Aligned_Physics/005_tomato_soup_can.usd", "xy": (0.30, -0.07)},
-    {"name": "mustard_bottle", "usd": "/Isaac/Props/YCB/Axis_Aligned_Physics/006_mustard_bottle.usd", "xy": (-0.05, -0.03)},
+    {"name": "red_block", "color": (0.9, 0.05, 0.05), "xy": (-0.22, -0.28)},
+    {"name": "green_block", "color": (0.05, 0.8, 0.05), "xy": (0.0, -0.28)},
+    {"name": "blue_block", "color": (0.05, 0.15, 0.95), "xy": (0.22, -0.28)},
 )
 ENV_CAMERA_PATH = "/World/EnvCamera"
 # In front of the arm (it faces +Y) and a little lower, nearer the tabletop.
@@ -340,61 +340,30 @@ def _collide_room_table() -> None:
     api.CreateApproximationAttr("boundingCube")
 
 
-def _upside_down_quat(extents: np.ndarray) -> tuple[float, float, float, float]:
-    """Rotate so the prop's longest side points down."""
-    axis = int(np.argmax(extents))
-    half = np.pi / 4.0
-    if axis == 2:
-        # Rx(180) takes local +Z onto world -Z.
-        return (0.0, 1.0, 0.0, 0.0)
-    if axis == 0:
-        # Ry(90) takes local +X onto world -Z.
-        return (float(np.cos(half)), 0.0, float(np.sin(half)), 0.0)
-    # Rx(-90) takes local +Y onto world -Z.
-    return (float(np.cos(-half)), float(np.sin(-half)), 0.0, 0.0)
-
-
-def _place_prop(app, assets: str, spec: dict) -> str:
-    """Reference a prop, flip it upside down, and sit it on the table."""
+def _place_block(spec: dict) -> str:
+    """Create a colored, dynamic cube on the tabletop."""
     import omni.usd
-    import isaacsim.core.experimental.utils.stage as stage_utils
-    from pxr import Usd, UsdGeom
+    from pxr import Gf, UsdGeom, UsdPhysics
 
     path = f"/World/{spec['name']}"
-    stage_utils.add_reference_to_stage(assets + spec["usd"], path)
     stage = omni.usd.get_context().get_stage()
-    stage.Load(path)
     xy = spec["xy"]
-    origin = (float(xy[0]), float(xy[1]), TABLE_TOP_Z)
-    _author_camera_pose(path, origin, (1.0, 0.0, 0.0, 0.0))
-    for _ in range(5):
-        app.update()
-    cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render"])
-    box = cache.ComputeWorldBound(stage.GetPrimAtPath(path)).ComputeAlignedBox()
-    minimum, maximum = box.GetMin(), box.GetMax()
-    extents = np.array([float(maximum[i] - minimum[i]) for i in range(3)], dtype=np.float64)
-    if float(extents[2]) < 0.01 and float(np.max(extents)) < 0.01:
-        names = [child.GetName() for child in stage.GetPrimAtPath(path).GetChildren()]
-        raise RuntimeError(f"{spec['usd']} has no mesh bounds; children {names}")
-    quat = _upside_down_quat(extents)
-    _author_camera_pose(path, origin, quat)
-    for _ in range(2):
-        app.update()
-    cache.Clear()
-    box = cache.ComputeWorldBound(stage.GetPrimAtPath(path)).ComputeAlignedBox()
-    minimum = box.GetMin()
-    z = TABLE_TOP_Z + (TABLE_TOP_Z - float(minimum[2])) + 0.005
-    _author_camera_pose(path, (float(xy[0]), float(xy[1]), z), quat)
-    for _ in range(2):
-        app.update()
-    cache.Clear()
-    box = cache.ComputeWorldBound(stage.GetPrimAtPath(path)).ComputeAlignedBox()
+    cube = UsdGeom.Cube.Define(stage, path)
+    cube.CreateSizeAttr(BLOCK_SIZE)
+    cube.CreateDisplayColorAttr([spec["color"]])
+    prim = cube.GetPrim()
+    UsdPhysics.CollisionAPI.Apply(prim)
+    UsdPhysics.RigidBodyAPI.Apply(prim)
+    xform = UsdGeom.Xformable(prim)
+    xform.AddTranslateOp().Set(
+        Gf.Vec3d(float(xy[0]), float(xy[1]), TABLE_TOP_Z + BLOCK_SIZE / 2.0 + 0.002)
+    )
     _record_prop_bounds(spec)
     return path
 
 
 def build_scene(app) -> FrankaScene:
-    """Load the simple room, Franka, YCB props, wrist camera, and environment camera."""
+    """Load the simple room, Franka, three colored blocks, and both cameras."""
     import omni.replicator.core as rep
     import isaacsim.core.experimental.utils.app as app_utils
     import isaacsim.core.experimental.utils.stage as stage_utils
@@ -421,7 +390,7 @@ def build_scene(app) -> FrankaScene:
     _place_arm("/World/Arm")
     _log(f"referenced {usd}")
 
-    object_paths = {spec["name"]: _place_prop(app, assets, spec) for spec in SCENE_OBJECTS}
+    object_paths = {spec["name"]: _place_block(spec) for spec in SCENE_OBJECTS}
 
     import omni.usd
 

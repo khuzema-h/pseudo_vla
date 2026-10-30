@@ -10,14 +10,14 @@ from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
 from curobo.scene import Cuboid, Scene
 from curobo.types import GoalToolPose, JointState, Pose
 
-from pseudo_vla.perception import ApproachGoal, quat_inverse, quat_to_matrix, world_to_base
+from pseudo_vla.perception import ApproachGoal, quat_inverse, world_to_base
 from pseudo_vla.scene import ARM_JOINT_NAMES, SCENE_OBJECTS, TABLE_CENTER, TABLE_DIMS, object_center, object_dims
 
 REPLAN_DISTANCE = 0.02
 GOAL_TOLERANCE = 0.005
 KINEMATICS_TOLERANCE = 0.02
-# Extra box around each prop so the arm's collision spheres clear the mesh.
-OBSTACLE_PADDING = 0.02
+# Match block collision boxes to their actual dimensions so the 10 cm hover pose clears them.
+OBSTACLE_PADDING = 0.0
 
 
 @dataclass
@@ -45,8 +45,10 @@ class ArmServo:
         self._base_quat = np.asarray(base_quat, dtype=np.float64)
         self._boxes = _obstacle_boxes(self._base_position, self._base_quat)
         self.planner.update_world(Scene(cuboid=[box.cuboid for box in self._boxes]))
+        for box in self._boxes:
+            if box.name != "table":
+                self.planner.scene_collision_checker.enable_obstacle(box.name, True)
         self.planner.warmup()
-        self._ignored: set[str] = set()
         self.trajectory: ActiveTrajectory | None = None
         self.goal: ApproachGoal | None = None
         self.home_goal: ApproachGoal | None = None
@@ -68,7 +70,7 @@ class ArmServo:
         self.home_goal = ApproachGoal(
             position=pose.position[0].detach().cpu().numpy().copy(),
             quaternion=pose.quaternion[0].detach().cpu().numpy().copy(),
-            median_world=np.zeros(3, dtype=np.float64),
+            center_world=np.zeros(3, dtype=np.float64),
             top_z=0.0,
         )
 
@@ -87,16 +89,13 @@ class ArmServo:
         pose = self.planner.compute_kinematics(state).tool_poses.get_link_pose("panda_hand")
         return pose.position[0].detach().cpu().numpy()
 
-    def update_goal(self, goal: ApproachGoal, joint_map: dict[str, float], ignore_name: str | None = None) -> None:
-        obstacles_changed = self._ignore(ignore_name, joint_map)
+    def update_goal(self, goal: ApproachGoal, joint_map: dict[str, float]) -> None:
         moved = self.goal is None or float(np.linalg.norm(goal.position - self.goal.position)) > REPLAN_DISTANCE
         inactive = self.trajectory is None or self.trajectory.finished
         off_goal = False
         if inactive and self.goal is not None:
             off_goal = float(np.linalg.norm(self.hand_position(joint_map) - self.goal.position)) > GOAL_TOLERANCE
-        if not obstacles_changed and not moved and not inactive and not off_goal:
-            return
-        if not obstacles_changed and not moved and inactive and not off_goal:
+        if not moved and (not inactive or not off_goal):
             return
         self.goal = goal
         self._plan(joint_map)
@@ -132,40 +131,6 @@ class ArmServo:
         self.trajectory = ActiveTrajectory(positions=trajectory, joint_names=names, index=0)
         print(f"planned {len(trajectory)} waypoints")
 
-    def _ignore(self, destination: str | None, joint_map: dict[str, float]) -> bool:
-        """Keep the destination and any prop the arm is already inside out of the collision world."""
-        ignored = self._penetrating(joint_map)
-        if destination is not None:
-            ignored.add(destination)
-        if ignored == self._ignored:
-            return False
-        checker = self.planner.scene_collision_checker
-        for name in self._ignored - ignored:
-            checker.enable_obstacle(name, True)
-        for name in ignored - self._ignored:
-            checker.enable_obstacle(name, False)
-        self._ignored = ignored
-        print(f"collision ignores {sorted(ignored) if ignored else 'nothing'}")
-        return True
-
-    def _penetrating(self, joint_map: dict[str, float]) -> set[str]:
-        state = self._joint_state(joint_map)
-        spheres = self.planner.compute_kinematics(state).robot_spheres
-        centers = spheres.detach().reshape(-1, spheres.shape[-1])[:, :3].cpu().numpy()
-        radii = spheres.detach().reshape(-1, spheres.shape[-1])[:, 3].cpu().numpy()
-        hit: set[str] = set()
-        for box in self._boxes:
-            if box.name == "table":
-                continue
-            local = (box.rotation.T @ (centers - box.center).T).T
-            delta = np.abs(local) - box.half
-            outside = np.linalg.norm(np.maximum(delta, 0.0), axis=1)
-            inside = np.max(delta, axis=1)
-            distance = np.where(np.all(delta < 0.0, axis=1), inside, outside)
-            if np.any(distance < radii - 0.001):
-                hit.add(box.name)
-        return hit
-
     def _joint_state(self, joint_map: dict[str, float]) -> JointState:
         names = list(self.planner.joint_names)
         missing = [name for name in names if name not in joint_map]
@@ -178,9 +143,6 @@ class ArmServo:
 @dataclass
 class _ObstacleBox:
     name: str
-    center: np.ndarray
-    half: np.ndarray
-    rotation: np.ndarray
     cuboid: Cuboid
 
 
@@ -190,7 +152,6 @@ def _obstacle_boxes(base_position: np.ndarray, base_quat: np.ndarray) -> list[_O
     specs.extend(
         (spec["name"], object_center(spec), object_dims(spec), OBSTACLE_PADDING) for spec in SCENE_OBJECTS
     )
-    rotation = quat_to_matrix(quat_inverse(base_quat))
     boxes = []
     for name, center_world, dims_world, padding in specs:
         center = world_to_base(np.asarray(center_world, dtype=np.float64).reshape(1, 3), base_position, base_quat)[0]
@@ -200,9 +161,6 @@ def _obstacle_boxes(base_position: np.ndarray, base_quat: np.ndarray) -> list[_O
         boxes.append(
             _ObstacleBox(
                 name=name,
-                center=center,
-                half=dims / 2.0,
-                rotation=rotation,
                 cuboid=Cuboid(name=name, dims=[float(value) for value in dims], pose=pose),
             )
         )

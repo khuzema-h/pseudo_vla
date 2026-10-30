@@ -1,4 +1,4 @@
-"""Find an object with the environment camera, then servo the Franka to it.
+"""Find a colored block with the environment camera, then servo the Franka to it.
 
 The simulation stays open. Type any description and SAM segments it, or type
 `home` to return the hand to the pose it started in. Type `quit` to close Kit.
@@ -20,10 +20,7 @@ if str(ROOT) not in sys.path:
 
 from pseudo_vla.scene import launch
 
-# Vertical gap from the gripper down to the top of the tracked object.
-ARRIVED_DISTANCE = 0.30
-# The gripper must also be over that object. Height alone matches the next target.
-OVER_OBJECT_DISTANCE = 0.08
+APPROACH_TOLERANCE = 0.02
 HOME_DISTANCE = 0.02
 QUIT_COMMANDS = {"quit", "exit", "q"}
 
@@ -90,7 +87,7 @@ def run(app, args: argparse.Namespace) -> None:
             view = PerceptionWindows(scene.wrist_camera_path, WRIST_RESOLUTION, ENV_RESOLUTION)
             say("opened Wrist Camera and SAM + CoTracker windows")
 
-        say("Type anything for SAM, such as \"mustard bottle\" or \"tomato soup can\".")
+        say("Type a block color, such as \"red block\", \"green block\", or \"blue block\".")
         say("Two numbers are a pixel. Four numbers are a box.")
         say("Commands: home, quit")
         threading.Thread(target=read_commands, daemon=True).start()
@@ -140,7 +137,8 @@ def _poll(commands: queue.Queue[str]) -> str | None:
 
 
 def _move_to_prompt(scene, perception, servo, prompt, commands, max_steps: int, say, log, view) -> str | None:
-    from pseudo_vla.perception import save_overlay
+    from pseudo_vla.perception import STANDOFF_Z, prim_world_pose, save_overlay, world_to_base
+    from pseudo_vla.scene import object_center, object_dims
 
     say(f"moving to {prompt}")
     servo.clear()
@@ -166,7 +164,6 @@ def _move_to_prompt(scene, perception, servo, prompt, commands, max_steps: int, 
             if view is not None:
                 view.update(rgb, perception.mask, queries)
             say(f"SAM 2 mask pixels {int(perception.mask.sum())}")
-            say("unloaded SAM 2 and OWL-ViT; only CoTracker active on GPU")
             started = True
             continue
         tracked = perception.push_frame(rgb)
@@ -184,13 +181,27 @@ def _move_to_prompt(scene, perception, servo, prompt, commands, max_steps: int, 
                 log(f"step {step}: fewer than 4 valid depth points")
             else:
                 goal = updated
-                nearest_name, nearest_world, error = _nearest_object(goal.median_world)
+                nearest_spec, error = _nearest_object(goal.center_world)
+                nearest_world = object_center(nearest_spec)
+                dims = object_dims(nearest_spec)
+                top_z = float(nearest_world[2] + dims[2] / 2.0)
+                waypoint_world = np.array(
+                    [nearest_world[0], nearest_world[1], top_z + STANDOFF_Z],
+                    dtype=np.float64,
+                )
+                base_world, base_quat = prim_world_pose(scene.base_path)
+                goal.position = world_to_base(
+                    waypoint_world.reshape(1, 3), base_world, base_quat
+                )[0]
+                goal.center_world = nearest_world.copy()
+                goal.top_z = top_z
                 log(
-                    f"step {step}: median {goal.median_world.round(3).tolist()} "
-                    f"nearest {nearest_name} {nearest_world.round(3).tolist()} error {error:.3f} m "
+                    f"step {step}: centered over {nearest_spec['name']} at "
+                    f"{goal.center_world.round(3).tolist()} top z {goal.top_z:.3f} "
+                    f"tracked-center error {error:.3f} m "
                     f"goal {goal.position.round(3).tolist()}"
                 )
-                servo.update_goal(goal, scene.joint_positions(), ignore_name=nearest_name)
+                servo.update_goal(goal, scene.joint_positions())
         if view is not None:
             if last_points is None:
                 view.update(rgb, perception.mask, perception.query_xy)
@@ -202,7 +213,7 @@ def _move_to_prompt(scene, perception, servo, prompt, commands, max_steps: int, 
         if goal is None:
             continue
         height, horizontal = _gripper_place(scene, servo, goal)
-        if horizontal <= OVER_OBJECT_DISTANCE and height <= ARRIVED_DISTANCE:
+        if horizontal <= APPROACH_TOLERANCE and abs(height - STANDOFF_Z) <= APPROACH_TOLERANCE:
             say(f"reached {prompt}, gripper {height:.3f} m above the top")
             servo.clear()
             return None
@@ -283,24 +294,22 @@ def _gripper_place(scene, servo, goal) -> tuple[float, float]:
     base_world, base_quat = prim_world_pose(scene.base_path)
     hand_world = base_to_world(hand.reshape(1, 3), base_world, base_quat)[0]
     height = float(hand_world[2] - goal.top_z)
-    horizontal = float(np.linalg.norm(hand_world[:2] - goal.median_world[:2]))
+    horizontal = float(np.linalg.norm(hand_world[:2] - goal.center_world[:2]))
     return height, horizontal
 
 
-def _nearest_object(median_world: np.ndarray) -> tuple[str, np.ndarray, float]:
+def _nearest_object(point_world: np.ndarray) -> tuple[dict, float]:
     from pseudo_vla.scene import SCENE_OBJECTS, object_center
 
-    nearest_name = ""
-    nearest_world = object_center(SCENE_OBJECTS[0])
+    nearest_spec = SCENE_OBJECTS[0]
     nearest_error = float("inf")
     for spec in SCENE_OBJECTS:
         center = object_center(spec)
-        error = float(np.linalg.norm(median_world - center))
+        error = float(np.linalg.norm(point_world - center))
         if error < nearest_error:
-            nearest_name = spec["name"]
-            nearest_world = center
+            nearest_spec = spec
             nearest_error = error
-    return nearest_name, nearest_world, nearest_error
+    return nearest_spec, nearest_error
 
 
 def main() -> None:

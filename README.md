@@ -8,21 +8,21 @@ This was brought up on an RTX 3080 Laptop (16 GB) with Python 3.12 and Torch 2.6
 
 ## What is in the scene
 
-Isaac Sim's simple room, with the Franka standing on the near edge of the table. Four YCB props sit in front of it: a cracker box, a sugar box, a tomato soup can, and a mustard bottle. They are upside down.
+Isaac Sim's simple room, with the Franka standing on the near edge of the table. Three 5 cm dynamic cubes sit in front of it: a red block, a green block, and a blue block.
 
 Two cameras:
 
 - **Wrist camera.** Mounted on the gripper and aimed into the fingers. The Isaac window titled "Wrist Camera" shows this view.
 - **Environment camera.** Fixed in front of the arm. Perception uses this image. The window titled "SAM + CoTracker" shows the mask and the tracked points.
 
-cuRobo treats the table and the other props as cuboid obstacles. The object you are reaching for is left out of the collision world so the hand can approach it.
+cuRobo treats the table and all three blocks as cuboid obstacles, including the block being approached.
 
 ## Layout
 
 | Path | Role |
 | --- | --- |
 | `scripts/track_and_servo.py` | Interactive entry point |
-| `pseudo_vla/scene.py` | Room, Franka, props, and both cameras |
+| `pseudo_vla/scene.py` | Room, Franka, colored blocks, and both cameras |
 | `pseudo_vla/perception.py` | OWL-ViT grounding, SAM 2, CoTracker3, depth unprojection |
 | `pseudo_vla/servo.py` | cuRobo planner and joint playback |
 | `pseudo_vla/view.py` | Wrist viewport and the SAM + CoTracker window |
@@ -72,7 +72,7 @@ wget -O ~/.cache/torch/hub/checkpoints/scaled_online.pth \
   https://huggingface.co/facebook/cotracker3/resolve/main/scaled_online.pth
 ```
 
-The first text prompt downloads `google/owlvit-base-patch32` into the Hugging Face cache. Isaac Sim downloads the simple room, the Franka, and the YCB props from its asset server on first launch, so that run needs network access.
+The first run downloads `google/owlvit-base-patch32` into the Hugging Face cache. Isaac Sim downloads the simple room and Franka from its asset server on first launch, so that run needs network access.
 
 Check that the GPU stack imports:
 
@@ -91,17 +91,17 @@ python scripts/track_and_servo.py
 
 The first Kit launch is slow. Later launches are much faster. When the prompt appears:
 
-- Type a description, such as `mustard bottle` or `tomato soup can`. OWL-ViT finds a box and SAM 2 segments it.
+- Type a description, such as `red block`, `green block`, or `blue block`. OWL-ViT finds a box and SAM 2 segments it.
 - Type two numbers for a pixel on the environment image, or four numbers for a box (`x1 y1 x2 y2`).
 - Type `home` to plan back to the pose the hand had at startup.
 - Type `quit` to close Kit.
 
-A move ends when the gripper is over the tracked object and within 30 cm of its top (`ARRIVED_DISTANCE` in `scripts/track_and_servo.py`). The sim keeps running after that. Typing another command during a move interrupts it.
+A move ends when the gripper is centered over the selected block and within 2 cm of the 10 cm hover waypoint. The sim keeps running after that. Typing another command during a move interrupts it.
 
 Useful flags:
 
 ```bash
-python scripts/track_and_servo.py --target "mustard bottle"   # first prompt, then stay open
+python scripts/track_and_servo.py --target "red block"       # first prompt, then stay open
 python scripts/track_and_servo.py --headless                  # no Isaac windows
 python scripts/track_and_servo.py --max-steps 600             # steps allowed for one move
 ```
@@ -111,7 +111,9 @@ Logs for each step go to `outputs/run.log`. The first segmented frame is saved t
 ## Current behavior
 
 - One process shares the GPU across Isaac Sim, SAM 2, CoTracker3, OWL-ViT, and cuRobo.
+- SAM 2 and OWL-ViT load once when perception starts and stay resident on the GPU between prompts.
 - Perception reads the environment camera. The wrist camera is a view of the gripper, not the finder.
 - Tracked points are unprojected with the depth image. The approach pose is 10 cm above the median point, with the hand pointing down.
-- The arm replans when the 3D goal moves. Props other than the current target, plus the table, are collision cuboids in the robot base frame.
+- The arm replans when the 3D goal moves. All blocks, including the current target, plus the table, are collision cuboids in the robot base frame.
 - The gripper does not close. The motion stops above the object.
+- The scene provides movable blocks, but the current controller does not pick up or stack them.
