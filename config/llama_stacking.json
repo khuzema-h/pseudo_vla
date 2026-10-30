@@ -1,0 +1,18 @@
+{
+  "model": "llama3.2:3b",
+  "system_prompt": "Parse the user's requested bottom-to-top stacking order. Return exactly three distinct colors, red, green, and blue, in the order requested, as JSON with a sequence array. Do not infer a color the user did not request.",
+  "response_schema": {
+    "type": "object",
+    "properties": {
+      "sequence": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "enum": ["red", "green", "blue"]
+        }
+      }
+    },
+    "required": ["sequence"],
+    "additionalProperties": false
+  }
+}

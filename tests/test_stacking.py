@@ -1,19 +1,13 @@
-import importlib.util
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 
+from pseudo_vla import controller as track_and_servo
 from pseudo_vla import perception
+from pseudo_vla import stacking_llm
 from pseudo_vla.view import _depth_image
-
-_SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "track_and_servo.py"
-_SCRIPT_SPEC = importlib.util.spec_from_file_location("track_and_servo_under_test", _SCRIPT_PATH)
-track_and_servo = importlib.util.module_from_spec(_SCRIPT_SPEC)
-_SCRIPT_SPEC.loader.exec_module(track_and_servo)
-
 
 class _FakeSam:
     def set_image(self, image):
@@ -234,13 +228,133 @@ class StackingPerceptionTests(unittest.TestCase):
         )
         messages = []
 
-        point, box = track_and_servo._prompt_to_sam(
-            perception_instance, image, "green block", messages.append
-        )
+        with patch(
+            "pseudo_vla.stacking_llm.normalize_object_prompt",
+            return_value="green block",
+        ) as normalize:
+            point, box = track_and_servo._prompt_to_sam(
+                perception_instance, image, "please find the green cube", messages.append
+            )
 
+        normalize.assert_called_once_with("please find the green cube")
         self.assertEqual(point, (12.0, 14.0))
         self.assertIsNone(box)
         self.assertIn("reusing active CoTracker points for green", messages[-1])
+
+    def test_numeric_point_and_box_prompts_bypass_llm(self):
+        image = np.zeros((32, 32, 3), dtype=np.uint8)
+        perception_instance = SimpleNamespace(ground=unittest.mock.Mock())
+        with patch("pseudo_vla.stacking_llm.normalize_object_prompt") as normalize:
+            point, point_box = track_and_servo._prompt_to_sam(
+                perception_instance, image, "12 14", lambda _message: None
+            )
+            box_point, box = track_and_servo._prompt_to_sam(
+                perception_instance, image, "1 2 20 24", lambda _message: None
+            )
+
+        self.assertEqual(point, (12.0, 14.0))
+        self.assertIsNone(point_box)
+        self.assertIsNone(box_point)
+        self.assertEqual(box, (1.0, 2.0, 20.0, 24.0))
+        normalize.assert_not_called()
+        perception_instance.ground.assert_not_called()
+
+    def test_llm_failure_prevents_object_grounding(self):
+        image = np.zeros((32, 32, 3), dtype=np.uint8)
+        perception_instance = SimpleNamespace(ground=unittest.mock.Mock())
+        messages = []
+        with patch(
+            "pseudo_vla.stacking_llm.normalize_object_prompt",
+            side_effect=stacking_llm.StackingModelError("connection refused"),
+        ):
+            point, box = track_and_servo._prompt_to_sam(
+                perception_instance, image, "green block", messages.append
+            )
+        self.assertIsNone(point)
+        self.assertIsNone(box)
+        self.assertIn("could not interpret object prompt with Llama", messages[-1])
+        perception_instance.ground.assert_not_called()
+
+    def test_text_stack_instruction_dispatches_to_stack_workflow(self):
+        scene, perception_instance, servo, commands = object(), object(), object(), object()
+        messages = []
+        relations = [
+            stacking_llm.StackingRelation(support="red", moving="blue")
+        ]
+        with (
+            patch(
+                "pseudo_vla.stacking_llm.interpret_user_prompt",
+                return_value=stacking_llm.UserPrompt(
+                    intent="stack_blocks",
+                    stacking_relations=relations,
+                ),
+            ),
+            patch.object(
+                track_and_servo,
+                "_run_requested_stack_relations",
+                return_value=True,
+            ) as run_stack,
+            patch.object(track_and_servo, "_move_to_prompt") as move,
+        ):
+            result = track_and_servo._dispatch_user_prompt(
+                scene,
+                perception_instance,
+                servo,
+                "stack blue on top of green then red on top of that",
+                commands,
+                600,
+                messages.append,
+                messages.append,
+                None,
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(run_stack.call_args.args[3], relations)
+        self.assertIn("interpreted requested placements: blue on red", messages)
+        self.assertIn("prompted stack complete; object prompts are available", messages)
+        move.assert_not_called()
+
+    def test_text_object_instruction_uses_llm_query_for_grounding(self):
+        parsed = stacking_llm.UserPrompt(intent="find_object", query="small green cube")
+        with (
+            patch("pseudo_vla.stacking_llm.interpret_user_prompt", return_value=parsed),
+            patch.object(track_and_servo, "_move_to_prompt", return_value="quit") as move,
+        ):
+            result = track_and_servo._dispatch_user_prompt(
+                object(),
+                object(),
+                object(),
+                "find the little green block",
+                object(),
+                600,
+                lambda _message: None,
+                lambda _message: None,
+                None,
+            )
+
+        self.assertEqual(result, "quit")
+        self.assertEqual(move.call_args.kwargs["grounding_prompt"], "small green cube")
+
+    def test_numeric_instruction_skips_llm_interpreter(self):
+        with (
+            patch("pseudo_vla.stacking_llm.interpret_user_prompt") as interpret,
+            patch.object(track_and_servo, "_move_to_prompt", return_value=None) as move,
+        ):
+            result = track_and_servo._dispatch_user_prompt(
+                object(),
+                object(),
+                object(),
+                "12 14",
+                object(),
+                600,
+                lambda _message: None,
+                lambda _message: None,
+                None,
+            )
+
+        self.assertIsNone(result)
+        interpret.assert_not_called()
+        self.assertNotIn("grounding_prompt", move.call_args.kwargs)
 
     def test_completed_stack_reseeds_tracker_on_placed_green_cube(self):
         image = np.zeros((32, 32, 3), dtype=np.uint8)

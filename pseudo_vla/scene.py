@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from pseudo_vla.blocks import BLOCK_SIZE, BLOCK_SPECS
+
 # Bounds of table_low in Isaac's Simple Room. The cuRobo cuboid uses the same box.
 TABLE_MIN = np.array([-1.592, -0.813, -0.77], dtype=np.float64)
 TABLE_MAX = np.array([1.593, 0.813, 0.01], dtype=np.float64)
@@ -15,13 +17,8 @@ TABLE_CENTER = (TABLE_MIN + TABLE_MAX) / 2.0
 TABLE_TOP_Z = float(TABLE_MAX[2])
 # The arm stands on the near edge of the table and faces +Y, toward the props.
 ARM_POSITION = (0.0, -0.60, TABLE_TOP_Z + 0.002)
-# Three grasp-sized blocks in front of the arm.
-BLOCK_SIZE = 0.05
-SCENE_OBJECTS = (
-    {"name": "red_block", "color": (0.9, 0.05, 0.05), "xy": (-0.22, -0.28)},
-    {"name": "green_block", "color": (0.05, 0.8, 0.05), "xy": (0.0, -0.28)},
-    {"name": "blue_block", "color": (0.05, 0.15, 0.95), "xy": (0.22, -0.28)},
-)
+# Keep the historical name for callers while sharing the canonical definitions.
+SCENE_OBJECTS = BLOCK_SPECS
 ENV_CAMERA_PATH = "/World/EnvCamera"
 # In front of the arm (it faces +Y), close enough to clearly resolve the blocks.
 ENV_CAMERA_EYE = np.array([0.0, 0.35, 0.65], dtype=np.float64)

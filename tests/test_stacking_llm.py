@@ -1,5 +1,4 @@
 import contextlib
-import importlib.util
 import io
 import json
 import unittest
@@ -7,12 +6,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from pseudo_vla import cli
+from pseudo_vla import controller as track_and_servo
 from pseudo_vla import stacking_llm
+from pseudo_vla import stacking_workflow
 
-_SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "track_and_servo.py"
-_SCRIPT_SPEC = importlib.util.spec_from_file_location("track_and_servo_llm_tests", _SCRIPT_PATH)
-track_and_servo = importlib.util.module_from_spec(_SCRIPT_SPEC)
-_SCRIPT_SPEC.loader.exec_module(track_and_servo)
+_CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 
 
 class StackingLlmTests(unittest.TestCase):
@@ -36,11 +35,165 @@ class StackingLlmTests(unittest.TestCase):
 
         request = post.call_args.args[0]
         payload = json.loads(request.data)
+        config = json.loads((_CONFIG_DIR / "llama_stacking.json").read_text(encoding="utf-8"))
         self.assertEqual(result, ["green", "red", "blue"])
         self.assertEqual(request.full_url, "http://127.0.0.1:11434/api/chat")
-        self.assertEqual(payload["model"], "llama3.2:3b")
+        self.assertEqual(payload["model"], config["model"])
+        self.assertEqual(payload["messages"][0]["content"], config["system_prompt"])
+        self.assertEqual(payload["format"], config["response_schema"])
         self.assertFalse(payload["stream"])
         self.assertEqual(payload["format"]["properties"]["sequence"]["items"]["enum"], ["red", "green", "blue"])
+
+    def test_object_prompt_uses_llama_structured_query(self):
+        response = {
+            "message": {
+                "content": json.dumps(
+                    {
+                        "intent": "find_object",
+                        "query": "small green cube",
+                        "stacking_relations": [],
+                    }
+                )
+            }
+        }
+        with self._mock_ollama(response) as post, patch.dict(
+            "os.environ", {"OLLAMA_HOST": "localhost:11434"}
+        ):
+            result = stacking_llm.normalize_object_prompt("find the little green block")
+
+        payload = json.loads(post.call_args.args[0].data)
+        config = json.loads((_CONFIG_DIR / "llama_task.json").read_text(encoding="utf-8"))
+        self.assertEqual(result, "small green cube")
+        self.assertEqual(post.call_args.args[0].full_url, "http://localhost:11434/api/chat")
+        self.assertEqual(payload["model"], config["model"])
+        self.assertEqual(payload["messages"][0]["content"], config["system_prompt"])
+        self.assertEqual(payload["messages"][1]["content"], "find the little green block")
+        self.assertEqual(payload["format"], config["response_schema"])
+        self.assertFalse(payload["stream"])
+
+    def test_object_prompt_rejects_empty_or_invalid_llm_query(self):
+        responses = (
+            {
+                "message": {
+                    "content": json.dumps(
+                        {"intent": "find_object", "query": " ", "stacking_relations": []}
+                    )
+                }
+            },
+            {"message": {"content": json.dumps({"response": "green block"})}},
+            {"message": {"content": "not json"}},
+        )
+        for response in responses:
+            with self.subTest(response=response), self._mock_ollama(response):
+                with self.assertRaises(stacking_llm.StackingModelError):
+                    stacking_llm.normalize_object_prompt("find a green block")
+
+    def test_interactive_task_interpreter_parses_only_requested_pair(self):
+        response = {
+            "message": {
+                "content": json.dumps(
+                    {
+                        "intent": "stack_blocks",
+                        "query": "",
+                        "stacking_relations": [
+                            {"upper": "blue", "lower": "red"},
+                        ],
+                    }
+                )
+            }
+        }
+        with self._mock_ollama(response) as post, patch.dict(
+            "os.environ", {"OLLAMA_HOST": "localhost:11434"}
+        ):
+            parsed = stacking_llm.interpret_user_prompt(
+                "stack blue on top of red"
+            )
+
+        payload = json.loads(post.call_args.args[0].data)
+        config = json.loads((_CONFIG_DIR / "llama_task.json").read_text(encoding="utf-8"))
+        self.assertEqual(parsed.intent, "stack_blocks")
+        self.assertEqual(
+            parsed.stacking_relations,
+            [stacking_llm.StackingRelation(support="red", moving="blue")],
+        )
+        self.assertIsNone(parsed.query)
+        self.assertEqual(payload["messages"][1]["content"], "stack blue on top of red")
+        self.assertEqual(payload["format"], config["response_schema"])
+
+    def test_interactive_task_interpreter_resolves_top_then_that_to_base_red_green(self):
+        response = {
+            "message": {
+                "content": json.dumps(
+                    {
+                        "intent": "stack_blocks",
+                        "query": "",
+                        "stacking_relations": [
+                            {"upper": "red", "lower": "blue"},
+                            {"upper": "green", "lower": "red"},
+                        ],
+                    }
+                )
+            }
+        }
+        with self._mock_ollama(response):
+            parsed = stacking_llm.interpret_user_prompt(
+                "stack red on top of blue then put green on top of that"
+            )
+
+        self.assertEqual(
+            parsed.stacking_relations,
+            [
+                stacking_llm.StackingRelation(support="blue", moving="red"),
+                stacking_llm.StackingRelation(support="red", moving="green"),
+            ],
+        )
+
+    def test_interactive_task_interpreter_returns_object_query(self):
+        response = {
+            "message": {
+                "content": json.dumps(
+                    {
+                        "intent": "find_object",
+                        "query": "small green cube",
+                        "stacking_relations": [],
+                    }
+                )
+            }
+        }
+        with self._mock_ollama(response):
+            parsed = stacking_llm.interpret_user_prompt("find the little green block")
+
+        self.assertEqual(parsed.intent, "find_object")
+        self.assertEqual(parsed.query, "small green cube")
+        self.assertIsNone(parsed.stacking_relations)
+
+    def test_interactive_task_interpreter_rejects_invalid_stacking_relations(self):
+        invalid_relations = (
+            [],
+            [
+                {"upper": "red", "lower": "blue"},
+                {"upper": "blue", "lower": "red"},
+            ],
+            [
+                {"upper": "red", "lower": "blue"},
+                {"upper": "green", "lower": "blue"},
+            ],
+        )
+        for relations in invalid_relations:
+            response = {
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "intent": "stack_blocks",
+                            "query": "",
+                            "stacking_relations": relations,
+                        }
+                    )
+                }
+            }
+            with self.subTest(relations=relations), self._mock_ollama(response):
+                with self.assertRaises(stacking_llm.StackingModelError):
+                    stacking_llm.interpret_user_prompt("stack blue on green")
 
     def test_prompt_parser_rejects_missing_duplicate_and_unknown_colors(self):
         cases = (
@@ -90,12 +243,18 @@ class StackingLlmTests(unittest.TestCase):
 
         request = post.call_args.args[0]
         payload = json.loads(request.data)
+        config = json.loads((_CONFIG_DIR / "d3_stacking.json").read_text(encoding="utf-8"))
         self.assertEqual(event, "stack_next")
         self.assertEqual(request.full_url, "http://localhost:11434/v1/systemone")
-        self.assertEqual(payload["model"], "d3:4b")
+        self.assertEqual(payload["model"], config["model"])
         self.assertEqual(payload["state"]["goal_order_bottom_to_top"], goal_order)
         self.assertEqual(payload["state"]["placed_bottom_to_top"], placed)
         self.assertEqual(payload["state"]["current_support"], "green")
+        self.assertEqual(payload["state"]["task"], config["task"])
+        self.assertEqual(
+            payload["questions"][config["question_id"]]["instructions"],
+            config["instructions"],
+        )
         self.assertEqual(payload["questions"]["next_event"]["criteria"], {
             "stack_next": "Place the next required cube (red) on the current support (green).",
             "stop": "Stop the stacking workflow at the current safe boundary.",
@@ -142,6 +301,74 @@ class StackingLlmTests(unittest.TestCase):
             {"support": "green", "moving": "red"},
         )
         self.assertEqual(set(payload["questions"]["next_event"]["criteria"]), {"grasp", "stop"})
+
+    def test_decision_model_authorizes_requested_pair_without_full_stack(self):
+        response = {
+            "answers": {
+                "next_event": {
+                    "type": "choice",
+                    "choice": "approach",
+                }
+            }
+        }
+        with self._mock_ollama(response) as post:
+            event = stacking_llm.choose_stack_action(
+                "red",
+                "blue",
+                "approach",
+                {"event": "placement_complete", "success": True},
+            )
+
+        payload = json.loads(post.call_args.args[0].data)
+        self.assertEqual(event, "approach")
+        self.assertEqual(payload["state"]["task"], "requested_pair_stacking")
+        self.assertEqual(
+            payload["state"]["requested_pair"],
+            {"support": "red", "moving": "blue"},
+        )
+        self.assertEqual(
+            set(payload["questions"]["next_event"]["criteria"]),
+            {"approach", "stop"},
+        )
+
+    def test_requested_pair_workflow_executes_only_explicit_placement(self):
+        relations = [
+            stacking_llm.StackingRelation(support="red", moving="blue")
+        ]
+        placements = []
+        authorized = []
+
+        def fake_stack_phase(scene, perception, servo, support, moving, *args):
+            placements.append((support, moving))
+            authorize = args[-1]
+            for stage in stacking_llm.STACK_ACTION_EVENTS:
+                self.assertTrue(authorize(stage))
+                authorized.append(stage)
+                self.assertTrue(authorize(stage, completed=True))
+            return True
+
+        with patch.object(
+            stacking_llm,
+            "choose_stack_action",
+            side_effect=lambda support, moving, stage, _result: stage,
+        ) as choose_action:
+            completed = stacking_workflow.run_requested_stack_relations(
+                object(),
+                object(),
+                object(),
+                relations,
+                object(),
+                10,
+                lambda _message: None,
+                lambda _message: None,
+                None,
+                fake_stack_phase,
+            )
+
+        self.assertTrue(completed)
+        self.assertEqual(placements, [("red", "blue")])
+        self.assertEqual(authorized, list(stacking_llm.STACK_ACTION_EVENTS))
+        self.assertEqual(choose_action.call_count, len(stacking_llm.STACK_ACTION_EVENTS))
 
     def test_decision_model_reports_endpoint_failure(self):
         with patch.object(
@@ -255,11 +482,11 @@ class StackingLlmTests(unittest.TestCase):
     def test_prompt_parse_failure_exits_before_simulator_launch(self):
         with (
             patch.object(
-                track_and_servo,
+                cli,
                 "parse_args",
                 return_value=SimpleNamespace(stack_prompt="bad request", headless=False),
             ),
-            patch.object(track_and_servo, "launch") as launch,
+            patch.object(cli, "launch") as launch,
             patch.object(
                 stacking_llm,
                 "parse_stacking_prompt",
@@ -268,7 +495,7 @@ class StackingLlmTests(unittest.TestCase):
             contextlib.redirect_stderr(io.StringIO()) as stderr,
         ):
             with self.assertRaises(SystemExit) as exit_error:
-                track_and_servo.main()
+                cli.main()
 
         self.assertEqual(exit_error.exception.code, 2)
         self.assertIn("could not parse --stack-prompt", stderr.getvalue())
@@ -286,7 +513,7 @@ class StackingLlmTests(unittest.TestCase):
             ],
         ):
             with self.assertRaises(SystemExit) as exit_error:
-                track_and_servo.parse_args()
+                cli.parse_args()
 
         self.assertEqual(exit_error.exception.code, 2)
 

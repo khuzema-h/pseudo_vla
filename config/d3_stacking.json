@@ -1,0 +1,17 @@
+{
+  "model": "d3:4b",
+  "task": "three_cube_stacking",
+  "question_id": "next_event",
+  "question_type": "choice",
+  "instructions": "Choose the next event for the stacking task. Follow the requested bottom-to-top order and choose only an event whose conditions are satisfied by the state.",
+  "criteria_templates": {
+    "authorize": "Authorize the {event} stage for {moving} on {support}.",
+    "stop_authorize": "Stop at this safe task boundary without executing the next stage.",
+    "establish_base": "Establish the first requested cube as the table-supported base.",
+    "stop_base": "Stop the stacking workflow without moving the robot.",
+    "stack_next": "Place the next required cube ({next_cube}) on the current support ({current_support}).",
+    "stop_placement": "Stop the stacking workflow at the current safe boundary.",
+    "finish": "Finish because all requested cubes have been placed.",
+    "stop_finish": "Stop the workflow at the current safe boundary."
+  }
+}
