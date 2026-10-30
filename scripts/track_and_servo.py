@@ -166,6 +166,7 @@ def _move_to_prompt(scene, perception, servo, prompt, commands, max_steps: int, 
             if view is not None:
                 view.update(rgb, perception.mask, queries)
             say(f"SAM 2 mask pixels {int(perception.mask.sum())}")
+            say("unloaded SAM 2 and OWL-ViT; only CoTracker active on GPU")
             started = True
             continue
         tracked = perception.push_frame(rgb)

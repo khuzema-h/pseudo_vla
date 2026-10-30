@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import gc
 from pathlib import Path
 
 import numpy as np
@@ -97,17 +98,14 @@ class Perception:
             raise FileNotFoundError(SAM_CHECKPOINT)
         if not COTRACKER_CHECKPOINT.is_file():
             raise FileNotFoundError(COTRACKER_CHECKPOINT)
-        import sam2  # noqa: F401  hydra config module
         from cotracker.predictor import CoTrackerOnlinePredictor
-        from sam2.build_sam import build_sam2
-        from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-        model = build_sam2(SAM_CONFIG, str(SAM_CHECKPOINT), device="cuda")
-        self.sam = SAM2ImagePredictor(model)
         self.tracker = CoTrackerOnlinePredictor(
             checkpoint=str(COTRACKER_CHECKPOINT),
             offline=False,
         ).cuda()
+        self.sam = None
+        self._sam_model = None
         self.frames: list[np.ndarray] = []
         self.queries: torch.Tensor | None = None
         self._window_start = 0
@@ -116,84 +114,126 @@ class Perception:
         self._owl = None
         self._owl_processor = None
 
-    def ground(self, rgb: np.ndarray, text: str) -> tuple[tuple[float, float, float, float], float] | None:
-        """Turn a free-text prompt into the best box on this image. Returns None when nothing matches."""
-        self._ensure_grounder()
-        from PIL import Image
-
-        image = np.ascontiguousarray(rgb[..., :3])
-        if image.dtype != np.uint8:
-            image = np.clip(image, 0, 255).astype(np.uint8)
-        phrase = " ".join(text.replace("_", " ").split())
-        inputs = self._owl_processor(text=[[phrase]], images=Image.fromarray(image), return_tensors="pt")
-        inputs = {key: value.to("cuda") if hasattr(value, "to") else value for key, value in inputs.items()}
-        with torch.no_grad():
-            outputs = self._owl(**inputs)
-        height, width = image.shape[:2]
-        found = self._owl_processor.post_process_grounded_object_detection(
-            outputs,
-            threshold=0.0,
-            target_sizes=[(height, width)],
-            text_labels=[[phrase]],
-        )[0]
-        if found["scores"].numel() == 0:
-            return None
-        order = torch.argsort(found["scores"], descending=True)
-        for index in order.tolist():
-            score = float(found["scores"][index])
-            if score < 0.008:
-                break
-            x1, y1, x2, y2 = (float(value) for value in found["boxes"][index].detach().cpu().tolist())
-            x1, x2 = sorted((min(max(x1, 0.0), width - 1.0), min(max(x2, 0.0), width - 1.0)))
-            y1, y2 = sorted((min(max(y1, 0.0), height - 1.0), min(max(y2, 0.0), height - 1.0)))
-            area = (x2 - x1) * (y2 - y1)
-            if area < 16.0 or area > 0.2 * width * height:
-                continue
-            return (x1, y1, x2, y2), score
-        return None
-
     def _ensure_grounder(self) -> None:
         if self._owl is not None:
             return
         from transformers import OwlViTForObjectDetection, OwlViTProcessor
 
-        self._owl_processor = OwlViTProcessor.from_pretrained("google/owlvit-base-patch32")
+        if self._owl_processor is None:
+            self._owl_processor = OwlViTProcessor.from_pretrained("google/owlvit-base-patch32")
         self._owl = OwlViTForObjectDetection.from_pretrained("google/owlvit-base-patch32").cuda().eval()
+
+    def unload_grounder(self) -> None:
+        """Unload OWL-ViT model from GPU."""
+        if self._owl is not None:
+            self._owl.to("cpu")
+            self._owl = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def _ensure_sam(self) -> None:
+        if self.sam is not None:
+            return
+        import sam2  # noqa: F401  hydra config module
+        from sam2.build_sam import build_sam2
+        from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+        self._sam_model = build_sam2(SAM_CONFIG, str(SAM_CHECKPOINT), device="cuda")
+        self.sam = SAM2ImagePredictor(self._sam_model)
+
+    def unload_sam(self) -> None:
+        """Unload SAM 2 model and embeddings from GPU."""
+        if self.sam is not None:
+            self.sam.reset_predictor()
+            if hasattr(self.sam.model, "to"):
+                self.sam.model.to("cpu")
+            self.sam = None
+            self._sam_model = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def unload_frame0_models(self) -> None:
+        """Unload both OWL-ViT and SAM 2 from GPU to leave only CoTracker active."""
+        self.unload_grounder()
+        self.unload_sam()
+
+    def ground(self, rgb: np.ndarray, text: str) -> tuple[tuple[float, float, float, float], float] | None:
+        """Turn a free-text prompt into the best box on this image. Returns None when nothing matches."""
+        self._ensure_grounder()
+        try:
+            from PIL import Image
+
+            image = np.ascontiguousarray(rgb[..., :3])
+            if image.dtype != np.uint8:
+                image = np.clip(image, 0, 255).astype(np.uint8)
+            phrase = " ".join(text.replace("_", " ").split())
+            inputs = self._owl_processor(text=[[phrase]], images=Image.fromarray(image), return_tensors="pt")
+            inputs = {key: value.to("cuda") if hasattr(value, "to") else value for key, value in inputs.items()}
+            with torch.no_grad():
+                outputs = self._owl(**inputs)
+            height, width = image.shape[:2]
+            found = self._owl_processor.post_process_grounded_object_detection(
+                outputs,
+                threshold=0.0,
+                target_sizes=[(height, width)],
+                text_labels=[[phrase]],
+            )[0]
+            if found["scores"].numel() == 0:
+                return None
+            order = torch.argsort(found["scores"], descending=True)
+            for index in order.tolist():
+                score = float(found["scores"][index])
+                if score < 0.008:
+                    break
+                x1, y1, x2, y2 = (float(value) for value in found["boxes"][index].detach().cpu().tolist())
+                x1, x2 = sorted((min(max(x1, 0.0), width - 1.0), min(max(x2, 0.0), width - 1.0)))
+                y1, y2 = sorted((min(max(y1, 0.0), height - 1.0), min(max(y2, 0.0), height - 1.0)))
+                area = (x2 - x1) * (y2 - y1)
+                if area < 16.0 or area > 0.2 * width * height:
+                    continue
+                return (x1, y1, x2, y2), score
+            return None
+        finally:
+            self.unload_grounder()
 
     def segment(self, rgb: np.ndarray, point: tuple[float, float] | None, box: tuple[float, float, float, float] | None) -> np.ndarray:
         image = np.ascontiguousarray(rgb)
         if image.dtype != np.uint8:
             image = np.clip(image, 0, 255).astype(np.uint8)
-        self.sam.set_image(image)
-        if point is not None:
-            masks, scores, _ = self.sam.predict(
-                point_coords=np.array([[point[0], point[1]]], dtype=np.float32),
-                point_labels=np.array([1], dtype=np.int32),
-                multimask_output=True,
+        self._ensure_sam()
+        try:
+            self.sam.set_image(image)
+            if point is not None:
+                masks, scores, _ = self.sam.predict(
+                    point_coords=np.array([[point[0], point[1]]], dtype=np.float32),
+                    point_labels=np.array([1], dtype=np.int32),
+                    multimask_output=True,
+                )
+            else:
+                masks, scores, _ = self.sam.predict(
+                    box=np.array(box, dtype=np.float32),
+                    multimask_output=False,
+                )
+            mask = masks[int(np.argmax(scores))] > 0
+            self.mask = mask
+            self.query_xy = sample_mask_points(mask, count=16)
+            queries = np.concatenate(
+                [np.zeros((self.query_xy.shape[0], 1), dtype=np.float32), self.query_xy.astype(np.float32)],
+                axis=1,
             )
-        else:
-            masks, scores, _ = self.sam.predict(
-                box=np.array(box, dtype=np.float32),
-                multimask_output=False,
+            self.queries = torch.from_numpy(queries).unsqueeze(0).cuda()
+            frame = _rgb_tensor(image)
+            self.tracker(
+                video_chunk=frame,
+                is_first_step=True,
+                queries=self.queries,
+                add_support_grid=True,
             )
-        mask = masks[int(np.argmax(scores))] > 0
-        self.mask = mask
-        self.query_xy = sample_mask_points(mask, count=16)
-        queries = np.concatenate(
-            [np.zeros((self.query_xy.shape[0], 1), dtype=np.float32), self.query_xy.astype(np.float32)],
-            axis=1,
-        )
-        self.queries = torch.from_numpy(queries).unsqueeze(0).cuda()
-        frame = _rgb_tensor(image)
-        self.tracker(
-            video_chunk=frame,
-            is_first_step=True,
-            queries=self.queries,
-            add_support_grid=True,
-        )
-        self.frames = [image]
-        self._window_start = 0
-        return self.query_xy
+            self.frames = [image]
+            self._window_start = 0
+            return self.query_xy
+        finally:
+            self.unload_frame0_models()
 
     def push_frame(self, rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
         image = np.ascontiguousarray(rgb)
