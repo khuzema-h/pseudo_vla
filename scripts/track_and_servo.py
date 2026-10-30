@@ -1,8 +1,9 @@
 """Find, stack, or servo to colored blocks with the environment camera.
 
 The simulation stays open. Type any description and SAM segments it, or type
-`stack` to stack red, blue, and green in order. Type `home` to return the hand
-to the pose it started in. Type `quit` to close Kit.
+`stack` to run the default red, blue, green workflow. Use `--stack-prompt` for
+a Llama-parsed bottom-to-top order orchestrated by d3. Type `home` to return
+the hand to its starting pose, or `quit` to close Kit.
 """
 
 from __future__ import annotations
@@ -32,7 +33,13 @@ QUIT_COMMANDS = {"quit", "exit", "q"}
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", type=str, help="First text prompt for SAM, before the prompt")
+    command_group = parser.add_mutually_exclusive_group()
+    command_group.add_argument("--target", type=str, help="First text prompt for SAM, before the prompt")
+    command_group.add_argument(
+        "--stack-prompt",
+        type=str,
+        help="Natural-language bottom-to-top cube order, parsed by local Llama before Isaac Sim starts",
+    )
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--max-steps", type=int, default=600, help="Steps to spend on one move before returning to the prompt")
     return parser.parse_args()
@@ -96,6 +103,16 @@ def run(app, args: argparse.Namespace) -> None:
         say("Two numbers are a pixel. Four numbers are a box.")
         say("Commands: stack, home, quit")
         threading.Thread(target=read_commands, daemon=True).start()
+
+        stack_order = getattr(args, "stack_order", None)
+        if stack_order is not None:
+            complete = _run_prompted_stack_sequence(
+                scene, perception, servo, stack_order, commands, args.max_steps, say, log, view
+            )
+            if complete:
+                say("prompted stack complete; object prompts are available")
+            else:
+                say("prompted stack stopped; returning to the interactive prompt")
 
         pending = _initial_command(args)
         prompt_shown = False
@@ -368,7 +385,19 @@ def _execute_pose(scene, servo, goal, perception, commands, max_steps: int, log,
     return False, None
 
 
-def _run_stack_phase(scene, perception, servo, support_name: str, moving_name: str, commands, max_steps: int, say, log, view) -> bool:
+def _run_stack_phase(
+    scene,
+    perception,
+    servo,
+    support_name: str,
+    moving_name: str,
+    commands,
+    max_steps: int,
+    say,
+    log,
+    view,
+    authorize_event=None,
+) -> bool:
     scene.step()
     rgb, depth, camera_params = scene.read_sensors()
     prompts = {}
@@ -400,10 +429,144 @@ def _run_stack_phase(scene, perception, servo, support_name: str, moving_name: s
         say,
         log,
         view,
+        authorize_event,
     )
 
 
-def _stack_tracked_cube(scene, perception, servo, support_name: str, moving_name: str, commands, max_steps: int, say, log, view) -> bool:
+def _run_prompted_stack_sequence(
+    scene,
+    perception,
+    servo,
+    goal_order: list[str],
+    commands,
+    max_steps: int,
+    say,
+    log,
+    view,
+) -> bool:
+    from pseudo_vla.stacking_llm import StackingModelError, choose_stack_event
+
+    placed: list[str] = []
+    current_support = None
+    last_event_result: dict[str, object] | None = None
+
+    while True:
+        try:
+            event = choose_stack_event(
+                goal_order,
+                placed,
+                current_support,
+                last_event_result,
+            )
+        except (StackingModelError, ValueError) as error:
+            say(f"stack orchestration failed safely: {error}")
+            return False
+
+        say(f"d3 selected stack event: {event}")
+        if event == "stop":
+            say("d3 stopped the stack workflow at a safe boundary")
+            return False
+        if event == "establish_base":
+            if placed:
+                say("d3 selected establish_base after the base was already set")
+                return False
+            current_support = goal_order[0]
+            placed.append(current_support)
+            last_event_result = {
+                "event": event,
+                "success": True,
+                "base": current_support,
+                "detail": "Base cube remains supported by the table.",
+            }
+            say(f"using {current_support} as the table-supported base")
+            continue
+        if event == "stack_next":
+            if not placed or len(placed) >= len(goal_order) or current_support != placed[-1]:
+                say("d3 selected stack_next in an invalid task state")
+                return False
+            moving_name = goal_order[len(placed)]
+
+            def authorize_event(stage: str, completed: bool = False) -> bool:
+                nonlocal last_event_result
+                if completed:
+                    last_event_result = {
+                        "event": stage,
+                        "success": True,
+                        "support": current_support,
+                        "moving": moving_name,
+                    }
+                    return True
+                try:
+                    selected = choose_stack_event(
+                        goal_order,
+                        placed,
+                        current_support,
+                        last_event_result,
+                        expected_event=stage,
+                        current_pair={"support": current_support, "moving": moving_name},
+                    )
+                except (StackingModelError, ValueError) as error:
+                    say(f"d3 could not authorize {stage} safely: {error}")
+                    return False
+                say(f"d3 selected stack event: {selected}")
+                if selected != stage:
+                    say(f"d3 stopped the stack workflow before {stage}")
+                    return False
+                return True
+
+            complete = _run_stack_phase(
+                scene,
+                perception,
+                servo,
+                current_support,
+                moving_name,
+                commands,
+                max_steps,
+                say,
+                log,
+                view,
+                authorize_event,
+            )
+            if not complete:
+                last_event_result = {
+                    "event": event,
+                    "success": False,
+                    "support": current_support,
+                    "moving": moving_name,
+                    "detail": "The controller did not complete the pairwise placement.",
+                }
+                return False
+            placed.append(moving_name)
+            current_support = moving_name
+            last_event_result = {
+                "event": event,
+                "success": True,
+                "support": placed[-2],
+                "moving": moving_name,
+            }
+            continue
+        if event == "finish":
+            if placed != goal_order:
+                say("d3 selected finish before the requested stack was complete")
+                return False
+            return True
+        say(f"d3 selected unsupported stack event {event!r}")
+        return False
+
+
+def _stack_tracked_cube(
+    scene,
+    perception,
+    servo,
+    support_name: str,
+    moving_name: str,
+    commands,
+    max_steps: int,
+    say,
+    log,
+    view,
+    authorize_event=None,
+) -> bool:
     from pseudo_vla.perception import (
         ApproachGoal,
         STANDOFF_Z,
@@ -419,6 +582,8 @@ def _stack_tracked_cube(scene, perception, servo, support_name: str, moving_name
     hover_goal = None
     transit = moving_name == "green"
 
+    if authorize_event is not None and not authorize_event("approach"):
+        return False
     say(f"approaching {moving_name} while tracking {support_name} as the placement target")
     servo.clear()
     for step in range(max_steps):
@@ -505,6 +670,8 @@ def _stack_tracked_cube(scene, perception, servo, support_name: str, moving_name
     if not reached:
         say(f"could not reach the wrist-refined hover pose for {moving_name}")
         return False
+    if authorize_event is not None:
+        authorize_event("approach", completed=True)
 
     grasp_alignment = _wrist_rgbd_goal(
         scene, perception, moving_name, wrist_hover_goal.center_world, hover_goal.quaternion, moving_dims, say
@@ -523,6 +690,8 @@ def _stack_tracked_cube(scene, perception, servo, support_name: str, moving_name
         top_z=grasp_alignment.top_z,
     )
 
+    if authorize_event is not None and not authorize_event("grasp"):
+        return False
     servo.set_obstacle_enabled(moving_spec["name"], False)
     try:
         say(f"grasping {moving_name}")
@@ -542,6 +711,8 @@ def _stack_tracked_cube(scene, perception, servo, support_name: str, moving_name
             view,
             retain_groups=("support",),
         )
+        if authorize_event is not None:
+            authorize_event("grasp", completed=True)
 
         moving_top = float(moving_center[2] + moving_dims[2] / 2.0)
         lift_world = moving_center.copy()
@@ -553,6 +724,8 @@ def _stack_tracked_cube(scene, perception, servo, support_name: str, moving_name
             center_world=moving_center.copy(),
             top_z=moving_top,
         )
+        if authorize_event is not None and not authorize_event("lift"):
+            return False
         say(f"lifting {moving_name}")
         reached, pending = _execute_pose(scene, servo, lift_goal, perception, commands, max_steps, log, view)
         if pending is not None or not reached:
@@ -562,6 +735,8 @@ def _stack_tracked_cube(scene, perception, servo, support_name: str, moving_name
             else:
                 say(f"could not lift {moving_name}")
             return False
+        if authorize_event is not None:
+            authorize_event("lift", completed=True)
 
         preplace_goal = None
         place_goal = None
@@ -607,6 +782,8 @@ def _stack_tracked_cube(scene, perception, servo, support_name: str, moving_name
             return False
 
         assert place_goal is not None and preplace_goal is not None
+        if authorize_event is not None and not authorize_event("place"):
+            return False
         servo.set_obstacle_enabled(support_spec["name"], False)
         try:
             say(f"lowering {moving_name} onto tracked {support_name} target")
@@ -622,6 +799,8 @@ def _stack_tracked_cube(scene, perception, servo, support_name: str, moving_name
                 return False
             scene.set_gripper_closed(False)
             _settle_tracker(scene, perception, GRIPPER_SETTLE_STEPS, view)
+            if authorize_event is not None:
+                authorize_event("place", completed=True)
         finally:
             servo.set_obstacle_enabled(support_spec["name"], True)
 
@@ -634,8 +813,11 @@ def _stack_tracked_cube(scene, perception, servo, support_name: str, moving_name
         if not reached:
             say(f"{moving_name} was released, but the gripper could not retreat")
             return False
-        if moving_name in {"blue", "green"}:
-            _seed_placed_cube_tracking(scene, perception, moving_name, say, view)
+        _seed_placed_cube_tracking(scene, perception, moving_name, say, view)
+        if authorize_event is not None and not authorize_event("verify_placement"):
+            return False
+        if authorize_event is not None:
+            authorize_event("verify_placement", completed=True)
         say(f"placed {moving_name} on {support_name}")
         return True
     finally:
@@ -949,6 +1131,14 @@ def _nearest_object(point_world: np.ndarray) -> tuple[dict, float]:
 
 def main() -> None:
     args = parse_args()
+    if args.stack_prompt is not None:
+        from pseudo_vla.stacking_llm import StackingModelError, parse_stacking_prompt
+
+        try:
+            args.stack_order = parse_stacking_prompt(args.stack_prompt)
+        except (StackingModelError, ValueError) as error:
+            print(f"could not parse --stack-prompt: {error}", file=sys.stderr, flush=True)
+            raise SystemExit(2) from error
     app = launch(args.headless)
     try:
         run(app, args)

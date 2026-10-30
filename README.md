@@ -96,7 +96,10 @@ The first Kit launch is slow. Later launches are much faster. When the prompt ap
 - Type `home` to plan back to the pose the hand had at startup.
 - Type `stack` to stack the blue cube on red. The controller tracks both cubes with one CoTracker instance and uses the red cube's tracked 3D points to place blue.
 - After blue is placed, type `continue`, `green`, or `green cube` to place green on blue. This pause lets you check the first placement before the second.
+- Launch with `--stack-prompt "stack green, then red, then blue"` to have local Llama parse a bottom-to-top order and d3 orchestrate the approach, grasp, lift, place, and verification stages without inter-placement pauses.
 - Type `quit` to close Kit.
+
+For prompted stacking, Ollama must be running locally with `llama3.2:3b` and `d3:4b` available. Llama parsing happens before Isaac Sim launches; d3 uses Ollama's typed `/v1/systemone` choice API at safe stage boundaries. A model/API failure stops the sequence rather than silently continuing. `OLLAMA_HOST` can override the default `http://localhost:11434` server address.
 
 A move approaches the selected block, lowers the open fingers around its center, closes the gripper, and lifts it to 20 cm above the block. It holds the block while waiting and opens only when the next non-quit command arrives. The target block is omitted from cuRobo collision checks only during intentional contact; the table and other blocks remain obstacles.
 
@@ -106,8 +109,16 @@ Useful flags:
 
 ```bash
 python scripts/track_and_servo.py --target "red block"       # first prompt, then stay open
+python scripts/track_and_servo.py --stack-prompt "stack green, then red, then blue" # model-orchestrated stack
 python scripts/track_and_servo.py --headless                  # no Isaac windows
 python scripts/track_and_servo.py --max-steps 600             # steps allowed for one move
+```
+
+Run the prompt-driven workflow in the project's Conda environment:
+
+```bash
+OMNI_KIT_ACCEPT_EULA=YES conda run -n ps_vla python scripts/track_and_servo.py \
+  --stack-prompt "stack green, then red, then blue"
 ```
 
 Logs for each step go to `outputs/run.log`. The first segmented frame is saved to `outputs/frame0_overlay.png`.
@@ -122,3 +133,5 @@ Logs for each step go to `outputs/run.log`. The first segmented frame is saved t
 - The arm replans when the 3D goal moves. All blocks, including the current target, plus the table, are collision cuboids during approach. Only the selected block is temporarily omitted for intentional finger contact and lifting.
 - After approach, the gripper closes around the selected block and attempts a 20 cm lift. It keeps holding the block until another command arrives, then opens before handling that command. The controller checks whether the block followed the gripper.
 - The `stack` command uses named support/moving point groups in one CoTracker instance to place blue on red, pauses for confirmation, then places green on blue.
+- `--stack-prompt` parses a bottom-to-top order with Llama before simulator startup. d3 selects the base, pairwise stacking, and completion transitions, and authorizes each approach, grasp, lift, place, and placement-verification stage. The controller enforces the requested order and executes the existing motion/perception routines.
+- Green pickup first routes to a higher transit waypoint, then descends to the 10 cm hover pose so the initial route clears nearby stacked blocks.
