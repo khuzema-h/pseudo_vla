@@ -101,6 +101,18 @@ class ArmServo:
         else:
             self._enabled_obstacles.remove(name)
 
+    def update_block_positions(self, centers: dict[str, np.ndarray]) -> None:
+        enabled = self._enabled_obstacles.copy()
+        self._boxes = _obstacle_boxes(self._base_position, self._base_quat, centers)
+        self.planner.update_world(Scene(cuboid=[box.cuboid for box in self._boxes]))
+        self._enabled_obstacles = set()
+        for box in self._boxes:
+            if box.name != "table":
+                is_enabled = box.name in enabled
+                self.planner.scene_collision_checker.enable_obstacle(box.name, is_enabled)
+                if is_enabled:
+                    self._enabled_obstacles.add(box.name)
+
     def update_goal(self, goal: ApproachGoal, joint_map: dict[str, float]) -> None:
         moved = self.goal is None or float(np.linalg.norm(goal.position - self.goal.position)) > REPLAN_DISTANCE
         inactive = self.trajectory is None or self.trajectory.finished
@@ -136,7 +148,14 @@ class ArmServo:
         result = self.planner.plan_pose(goal, state, max_attempts=3)
         trajectory = _trajectory_positions(result)
         if trajectory is None:
-            print("cuRobo plan failed; holding the current joints")
+            start = self.planner.compute_kinematics(state).tool_poses.get_link_pose("panda_hand")
+            start_position = start.position[0].detach().cpu().numpy()
+            print(
+                "cuRobo plan failed; holding the current joints "
+                f"(start position {start_position.round(3).tolist()}, "
+                f"goal position {self.goal.position.round(3).tolist()}, "
+                f"quaternion {self.goal.quaternion.round(3).tolist()})"
+            )
             self.trajectory = None
             return
         names = list(result.js_solution.joint_names or self.planner.joint_names)
@@ -158,12 +177,16 @@ class _ObstacleBox:
     cuboid: Cuboid
 
 
-def _obstacle_boxes(base_position: np.ndarray, base_quat: np.ndarray) -> list[_ObstacleBox]:
+def _obstacle_boxes(
+    base_position: np.ndarray,
+    base_quat: np.ndarray,
+    centers: dict[str, np.ndarray] | None = None,
+) -> list[_ObstacleBox]:
     """World-aligned boxes expressed in the robot base frame."""
     specs = [("table", TABLE_CENTER, TABLE_DIMS, 0.0)]
-    specs.extend(
-        (spec["name"], object_center(spec), object_dims(spec), OBSTACLE_PADDING) for spec in SCENE_OBJECTS
-    )
+    for spec in SCENE_OBJECTS:
+        center = (centers or {}).get(spec["name"], object_center(spec))
+        specs.append((spec["name"], center, object_dims(spec), OBSTACLE_PADDING))
     boxes = []
     for name, center_world, dims_world, padding in specs:
         center = world_to_base(np.asarray(center_world, dtype=np.float64).reshape(1, 3), base_position, base_quat)[0]

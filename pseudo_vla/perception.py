@@ -68,6 +68,45 @@ def base_to_world(points: np.ndarray, base_position: np.ndarray, base_quat_wxyz:
     return (rotation @ points.T).T + base_position
 
 
+def tracked_surface_top(points: np.ndarray) -> float:
+    """Estimate the top of a tracked surface while rejecting isolated depth outliers."""
+    if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] == 0:
+        raise ValueError("Tracked points must be a non-empty Nx3 array")
+    z_values = points[:, 2]
+    z_values = z_values[np.isfinite(z_values)]
+    if z_values.size == 0:
+        raise ValueError("Tracked points contain no finite depths")
+    median = float(np.median(z_values))
+    mad = float(np.median(np.abs(z_values - median)))
+    upper_bound = median + max(3.0 * 1.4826 * mad, 0.015)
+    inliers = z_values[z_values <= upper_bound]
+    return float(np.max(inliers))
+
+
+def stack_placement_world(
+    support_points: np.ndarray,
+    moving_dims: np.ndarray,
+    finger_reach: float,
+    clearance: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Return pre-place and release tool points above the tracked support surface."""
+    if support_points.ndim != 2 or support_points.shape[1] != 3 or support_points.shape[0] == 0:
+        raise ValueError("Support points must be a non-empty Nx3 array")
+    if moving_dims.shape != (3,) or np.any(moving_dims <= 0):
+        raise ValueError("Moving cube dimensions must be a positive 3-vector")
+    center_xy = np.median(support_points[:, :2], axis=0)
+    support_top = tracked_surface_top(support_points)
+    moving_center = np.array(
+        [center_xy[0], center_xy[1], support_top + moving_dims[2] / 2.0],
+        dtype=np.float64,
+    )
+    place_world = moving_center.copy()
+    place_world[2] += finger_reach
+    preplace_world = place_world.copy()
+    preplace_world[2] += clearance
+    return preplace_world, place_world, moving_center, support_top
+
+
 def prim_world_pose(path: str) -> tuple[np.ndarray, np.ndarray]:
     import omni.timeline
     import omni.usd
@@ -107,9 +146,11 @@ class Perception:
         self._sam_model = None
         self.frames: list[np.ndarray] = []
         self.queries: torch.Tensor | None = None
+        self.query_groups: dict[str, slice] = {}
         self._window_start = 0
         self.mask: np.ndarray | None = None
         self.query_xy: np.ndarray | None = None
+        self.group_masks: dict[str, np.ndarray] = {}
         self._owl = None
         self._owl_processor = None
         self._ensure_grounder()
@@ -171,43 +212,130 @@ class Perception:
         return None
 
     def segment(self, rgb: np.ndarray, point: tuple[float, float] | None, box: tuple[float, float, float, float] | None) -> np.ndarray:
+        groups = self.segment_groups(rgb, {"target": (point, box)})
+        return groups["target"]
+
+    def segment_mask(self, rgb: np.ndarray, point: tuple[float, float]) -> np.ndarray:
+        """Segment an object from a positive image point without changing tracker queries."""
+        image = np.ascontiguousarray(rgb[..., :3])
+        if image.dtype != np.uint8:
+            image = np.clip(image, 0, 255).astype(np.uint8)
+        self._ensure_sam()
+        try:
+            self.sam.set_image(image)
+            masks, scores, _ = self.sam.predict(
+                point_coords=np.array([[point[0], point[1]]], dtype=np.float32),
+                point_labels=np.array([1], dtype=np.int32),
+                multimask_output=True,
+            )
+            mask = masks[int(np.argmax(scores))] > 0
+            if not np.any(mask):
+                raise RuntimeError(f"SAM 2 returned an empty mask for point {point}")
+            return mask
+        finally:
+            self.sam.reset_predictor()
+
+    def segment_groups(
+        self,
+        rgb: np.ndarray,
+        prompts: dict[
+            str,
+            tuple[tuple[float, float] | None, tuple[float, float, float, float] | None],
+        ],
+        count_per_group: int = 16,
+    ) -> dict[str, np.ndarray]:
+        """Segment several objects in one frame and seed one tracker with named point groups."""
+        if not prompts:
+            raise ValueError("At least one named segmentation prompt is required")
+        if len(set(prompts)) != len(prompts):
+            raise ValueError("Segmentation group names must be unique")
         image = np.ascontiguousarray(rgb)
         if image.dtype != np.uint8:
             image = np.clip(image, 0, 255).astype(np.uint8)
         self._ensure_sam()
         try:
             self.sam.set_image(image)
-            if point is not None:
-                masks, scores, _ = self.sam.predict(
-                    point_coords=np.array([[point[0], point[1]]], dtype=np.float32),
-                    point_labels=np.array([1], dtype=np.int32),
-                    multimask_output=True,
-                )
-            else:
-                masks, scores, _ = self.sam.predict(
-                    box=np.array(box, dtype=np.float32),
-                    multimask_output=False,
-                )
-            mask = masks[int(np.argmax(scores))] > 0
-            self.mask = mask
-            self.query_xy = sample_mask_points(mask, count=16)
-            queries = np.concatenate(
-                [np.zeros((self.query_xy.shape[0], 1), dtype=np.float32), self.query_xy.astype(np.float32)],
-                axis=1,
-            )
-            self.queries = torch.from_numpy(queries).unsqueeze(0).cuda()
-            frame = _rgb_tensor(image)
-            self.tracker(
-                video_chunk=frame,
-                is_first_step=True,
-                queries=self.queries,
-                add_support_grid=True,
-            )
-            self.frames = [image]
-            self._window_start = 0
-            return self.query_xy
+            group_points: dict[str, np.ndarray] = {}
+            group_masks: dict[str, np.ndarray] = {}
+            for name, (point, box) in prompts.items():
+                if point is not None:
+                    masks, scores, _ = self.sam.predict(
+                        point_coords=np.array([[point[0], point[1]]], dtype=np.float32),
+                        point_labels=np.array([1], dtype=np.int32),
+                        multimask_output=True,
+                    )
+                elif box is not None:
+                    masks, scores, _ = self.sam.predict(
+                        box=np.array(box, dtype=np.float32),
+                        multimask_output=False,
+                    )
+                else:
+                    raise ValueError(f"Segmentation group {name!r} needs a point or box")
+                mask = masks[int(np.argmax(scores))] > 0
+                points_xy = sample_mask_points(mask, count=count_per_group)
+                group_points[name] = points_xy
+                group_masks[name] = mask
+
+            self.group_masks = group_masks
+            self._seed_tracker(image, group_points)
+            return group_points
         finally:
             self.sam.reset_predictor()
+
+    def retain_groups(self, rgb: np.ndarray, names: tuple[str, ...], count_per_group: int = 16) -> None:
+        """Reseed CoTracker on selected cached masks, dropping other groups' query points."""
+        if not names:
+            raise ValueError("At least one CoTracker group must be retained")
+        if len(set(names)) != len(names):
+            raise ValueError("CoTracker group names must be unique")
+        missing = [name for name in names if name not in self.group_masks]
+        if missing:
+            raise KeyError(f"No segmentation masks for CoTracker groups {missing}")
+        image = np.ascontiguousarray(rgb)
+        if image.dtype != np.uint8:
+            image = np.clip(image, 0, 255).astype(np.uint8)
+        group_points = {
+            name: sample_mask_points(self.group_masks[name], count=count_per_group)
+            for name in names
+        }
+        self._seed_tracker(image, group_points)
+
+    def _seed_tracker(self, image: np.ndarray, group_points: dict[str, np.ndarray]) -> None:
+        query_groups: dict[str, slice] = {}
+        query_chunks = []
+        offset = 0
+        for name, points_xy in group_points.items():
+            query_groups[name] = slice(offset, offset + len(points_xy))
+            offset += len(points_xy)
+            query_chunks.append(
+                np.concatenate(
+                    [
+                        np.zeros((len(points_xy), 1), dtype=np.float32),
+                        points_xy.astype(np.float32),
+                    ],
+                    axis=1,
+                )
+            )
+        self.query_groups = query_groups
+        self.query_xy = np.concatenate(list(group_points.values()), axis=0)
+        self.mask = np.logical_or.reduce([self.group_masks[name] for name in group_points])
+        queries = np.concatenate(query_chunks, axis=0)
+        self.queries = torch.from_numpy(queries).unsqueeze(0).cuda()
+        self.tracker(
+            video_chunk=_rgb_tensor(image),
+            is_first_step=True,
+            queries=self.queries,
+            add_support_grid=True,
+        )
+        self.frames = [image]
+        self._window_start = 0
+
+    def track_group(self, tracks_xy: np.ndarray, visible: np.ndarray, name: str) -> tuple[np.ndarray, np.ndarray]:
+        """Select the tracked coordinates and visibility for one seeded object group."""
+        if name not in self.query_groups:
+            raise KeyError(f"No CoTracker query group named {name!r}")
+        group = self.query_groups[name]
+        return tracks_xy[group], visible[group]
 
     def push_frame(self, rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
         if self.queries is None:
@@ -237,18 +365,33 @@ class Perception:
         camera_params: dict,
         camera_path: str,
         base_path: str,
+        group: str | None = None,
     ) -> ApproachGoal | None:
+        if group is not None:
+            tracks_xy, visible = self.track_group(tracks_xy, visible, group)
         points = unproject_tracks(tracks_xy, visible, depth, camera_params, camera_path)
         if points.shape[0] < MIN_TRACK_POINTS:
             return None
         center_world = np.median(points, axis=0)
-        top_z = float(np.max(points[:, 2]))
+        top_z = tracked_surface_top(points)
         base_position, base_quat = prim_world_pose(base_path)
         goal_world = np.array([center_world[0], center_world[1], top_z + STANDOFF_Z], dtype=np.float64)
         goal_base = world_to_base(goal_world.reshape(1, 3), base_position, base_quat)[0]
         goal_quat = quat_multiply(quat_inverse(base_quat), TOP_DOWN_WXYZ)
         goal_quat = goal_quat / np.linalg.norm(goal_quat)
         return ApproachGoal(position=goal_base, quaternion=goal_quat, center_world=center_world, top_z=top_z)
+
+    def tracked_group_points(
+        self,
+        name: str,
+        tracks_xy: np.ndarray,
+        visible: np.ndarray,
+        depth: np.ndarray,
+        camera_params: dict,
+        camera_path: str,
+    ) -> np.ndarray:
+        group_xy, group_visible = self.track_group(tracks_xy, visible, name)
+        return unproject_tracks(group_xy, group_visible, depth, camera_params, camera_path)
 
 
 def sample_mask_points(mask: np.ndarray, count: int = 16) -> np.ndarray:
@@ -275,6 +418,21 @@ def sample_mask_points(mask: np.ndarray, count: int = 16) -> np.ndarray:
             if len(unique) >= count:
                 break
     return np.asarray(unique[:count], dtype=np.float32)
+
+
+def mask_depth_points(
+    mask: np.ndarray,
+    depth: np.ndarray,
+    camera_params: dict,
+    camera_path: str,
+    count: int = 64,
+) -> np.ndarray:
+    """Unproject sampled mask pixels with valid depth into world coordinates."""
+    if mask.shape != depth.shape[:2]:
+        raise ValueError(f"Mask shape {mask.shape} does not match depth image {depth.shape[:2]}")
+    points_xy = sample_mask_points(mask, count=count)
+    visible = np.ones(len(points_xy), dtype=bool)
+    return unproject_tracks(points_xy, visible, depth, camera_params, camera_path)
 
 
 def unproject_tracks(

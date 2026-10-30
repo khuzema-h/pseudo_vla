@@ -94,9 +94,13 @@ The first Kit launch is slow. Later launches are much faster. When the prompt ap
 - Type a description, such as `red block`, `green block`, or `blue block`. OWL-ViT finds a box and SAM 2 segments it.
 - Type two numbers for a pixel on the environment image, or four numbers for a box (`x1 y1 x2 y2`).
 - Type `home` to plan back to the pose the hand had at startup.
+- Type `stack` to stack the blue cube on red. The controller tracks both cubes with one CoTracker instance and uses the red cube's tracked 3D points to place blue.
+- After blue is placed, type `continue`, `green`, or `green cube` to place green on blue. This pause lets you check the first placement before the second.
 - Type `quit` to close Kit.
 
 A move approaches the selected block, lowers the open fingers around its center, closes the gripper, and lifts it to 20 cm above the block. It holds the block while waiting and opens only when the next non-quit command arrives. The target block is omitted from cuRobo collision checks only during intentional contact; the table and other blocks remain obstacles.
+
+The stacking workflow seeds each cube's SAM mask at its projected image location and uses CoTracker points unprojected through the environment camera's depth to approach. At the hover pose, it segments the cube in the wrist-camera RGB image and uses wrist depth to refine the hover and grasp positions; it will not close the gripper if wrist RGB-D cannot localize the cube. It uses tracked support points for placement. After blue is picked, it drops blue's points and tracks red for placement. After blue is placed, it drops red's points and tracks blue. It pauses for an explicit `continue` command before tracking green alone through pickup; after pickup it drops green's points, tracks blue, and places green on the tracked top surface. Projected positions only seed SAM; the environment and wrist depth images provide 3D approach/grasp measurements. The moved block's collision geometry is refreshed from its simulated position after each phase.
 
 Useful flags:
 
@@ -113,8 +117,8 @@ Logs for each step go to `outputs/run.log`. The first segmented frame is saved t
 - One process shares the GPU across Isaac Sim, SAM 2, CoTracker3, OWL-ViT, and cuRobo.
 - SAM 2 and OWL-ViT load once when perception starts and stay resident on the GPU between prompts.
 - CoTracker continues receiving camera frames while idle and during motion, grasping, and lifting; it is reseeded when a new prompt selects an object.
-- Perception reads the environment camera. The wrist camera is a view of the gripper, not the finder.
+- Coarse perception uses environment-camera RGB-D; immediately before stacking grasps, wrist-camera RGB-D refines the cube's center and top surface. The UI shows live Jet-colored depth feeds for both cameras in the "Environment + Wrist Depth" window (near pixels are blue, far pixels are red; invalid depth is black).
 - Tracked points identify the selected block, then the scene block bounds define a centered 10 cm hover pose with the hand pointing down.
 - The arm replans when the 3D goal moves. All blocks, including the current target, plus the table, are collision cuboids during approach. Only the selected block is temporarily omitted for intentional finger contact and lifting.
 - After approach, the gripper closes around the selected block and attempts a 20 cm lift. It keeps holding the block until another command arrives, then opens before handling that command. The controller checks whether the block followed the gripper.
-- The controller does not yet place or stack a grasped block.
+- The `stack` command uses named support/moving point groups in one CoTracker instance to place blue on red, pauses for confirmation, then places green on blue.

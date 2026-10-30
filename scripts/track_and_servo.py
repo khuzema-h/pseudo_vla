@@ -1,7 +1,8 @@
-"""Find a colored block with the environment camera, then servo the Franka to it.
+"""Find, stack, or servo to colored blocks with the environment camera.
 
 The simulation stays open. Type any description and SAM segments it, or type
-`home` to return the hand to the pose it started in. Type `quit` to close Kit.
+`stack` to stack red, blue, and green in order. Type `home` to return the hand
+to the pose it started in. Type `quit` to close Kit.
 """
 
 from __future__ import annotations
@@ -92,19 +93,20 @@ def run(app, args: argparse.Namespace) -> None:
 
         say("Type a block color, such as \"red block\", \"green block\", or \"blue block\".")
         say("Two numbers are a pixel. Four numbers are a box.")
-        say("Commands: home, quit")
+        say("Commands: stack, home, quit")
         threading.Thread(target=read_commands, daemon=True).start()
 
         pending = _initial_command(args)
         prompt_shown = False
+        stack_stage = "idle"
         while True:
             if pending is None:
                 if not prompt_shown:
                     print("> ", end="", flush=True)
                     prompt_shown = True
                 scene.step()
-                rgb, _, _ = scene.read_sensors()
-                _update_tracker(perception, rgb, view)
+                rgb, depth, _ = scene.read_sensors()
+                _update_tracker(scene, perception, rgb, depth, view)
                 pending = _poll(commands)
                 continue
 
@@ -118,6 +120,25 @@ def run(app, args: argparse.Namespace) -> None:
                 return
             if scene.gripper_closed:
                 _open_gripper_for_next_command(scene, perception, say, view)
+            if stack_stage == "await_green":
+                if command not in {"continue", "green", "green cube"}:
+                    say("blue is stacked on red; type continue to stack green on blue, or quit")
+                    continue
+                complete = _run_stack_phase(
+                    scene, perception, servo, "blue", "green", commands, args.max_steps, say, log, view
+                )
+                if complete:
+                    stack_stage = "idle"
+                    say("stack complete; object prompts are available")
+                continue
+            if command == "stack":
+                complete = _run_stack_phase(
+                    scene, perception, servo, "red", "blue", commands, args.max_steps, say, log, view
+                )
+                if complete:
+                    stack_stage = "await_green"
+                    say("blue is stacked on red; type continue when ready to stack green on blue")
+                continue
             if command == "home":
                 pending = _home(scene, perception, servo, commands, args.max_steps, say, log, view)
                 continue
@@ -166,8 +187,7 @@ def _move_to_prompt(scene, perception, servo, prompt, commands, max_steps: int, 
                 return None
             queries = perception.segment(rgb, point, box)
             save_overlay(ROOT / "outputs" / "frame0_overlay.png", rgb, perception.mask, queries)
-            if view is not None:
-                view.update(rgb, perception.mask, queries)
+            _update_camera_views(scene, view, rgb, depth, perception.mask, queries)
             say(f"SAM 2 mask pixels {int(perception.mask.sum())}")
             started = True
             continue
@@ -208,11 +228,10 @@ def _move_to_prompt(scene, perception, servo, prompt, commands, max_steps: int, 
                     f"goal {goal.position.round(3).tolist()}"
                 )
                 servo.update_goal(goal, scene.joint_positions())
-        if view is not None:
-            if last_points is None:
-                view.update(rgb, perception.mask, perception.query_xy)
-            else:
-                view.update(rgb, None, last_points, last_visible)
+        if last_points is None:
+            _update_camera_views(scene, view, rgb, depth, perception.mask, perception.query_xy)
+        else:
+            _update_camera_views(scene, view, rgb, depth, None, last_points, last_visible)
         command = servo.command()
         if command:
             scene.set_joint_targets(command)
@@ -281,8 +300,8 @@ def _grasp_and_lift(scene, servo, spec, hover_goal, perception, commands, max_st
             if incoming:
                 return incoming
             scene.step()
-            rgb, _, _ = scene.read_sensors()
-            _update_tracker(perception, rgb, view)
+            rgb, depth, _ = scene.read_sensors()
+            _update_tracker(scene, perception, rgb, depth, view)
 
         top_z = float(center_world[2] + object_dims(spec)[2] / 2.0)
         lift_world = center_world.copy()
@@ -328,8 +347,8 @@ def _execute_pose(scene, servo, goal, perception, commands, max_steps: int, log,
         command = servo.command()
         if command:
             scene.set_joint_targets(command)
-        rgb, _, _ = scene.read_sensors()
-        _update_tracker(perception, rgb, view)
+        rgb, depth, _ = scene.read_sensors()
+        _update_tracker(scene, perception, rgb, depth, view)
         if float(np.linalg.norm(servo.hand_position(scene.joint_positions()) - goal.position)) <= APPROACH_TOLERANCE:
             return True, None
         if servo.trajectory is None:
@@ -339,6 +358,323 @@ def _execute_pose(scene, servo, goal, perception, commands, max_steps: int, log,
             distance = float(np.linalg.norm(servo.hand_position(scene.joint_positions()) - goal.position))
             log(f"pose step {step}: hand is {distance:.3f} m from target")
     return False, None
+
+
+def _run_stack_phase(scene, perception, servo, support_name: str, moving_name: str, commands, max_steps: int, say, log, view) -> bool:
+    scene.step()
+    rgb, depth, camera_params = scene.read_sensors()
+    prompts = {}
+    for group_name, object_name in (("support", support_name), ("moving", moving_name)):
+        point, box = _projected_cube_prompt(scene, rgb, camera_params, object_name, say)
+        if point is None and box is None:
+            return False
+        prompts[group_name] = (point, box)
+
+    perception.segment_groups(rgb, prompts)
+    if moving_name == "green":
+        perception.retain_groups(rgb, ("moving",))
+    _update_camera_views(scene, view, rgb, depth, perception.mask, perception.query_xy)
+    if moving_name == "green":
+        say(f"tracking {moving_name} only until pickup with {len(perception.query_xy)} CoTracker points")
+    else:
+        say(
+            f"tracking {support_name} support and {moving_name} cube with "
+            f"{len(perception.query_xy)} CoTracker points"
+        )
+    return _stack_tracked_cube(
+        scene,
+        perception,
+        servo,
+        support_name,
+        moving_name,
+        commands,
+        max_steps,
+        say,
+        log,
+        view,
+    )
+
+
+def _stack_tracked_cube(scene, perception, servo, support_name: str, moving_name: str, commands, max_steps: int, say, log, view) -> bool:
+    from pseudo_vla.perception import (
+        ApproachGoal,
+        STANDOFF_Z,
+        prim_world_pose,
+        world_to_base,
+    )
+    from pseudo_vla.scene import SCENE_OBJECTS, object_dims
+
+    specs = {spec["name"].removesuffix("_block"): spec for spec in SCENE_OBJECTS}
+    support_spec = specs[support_name]
+    moving_spec = specs[moving_name]
+    moving_dims = object_dims(moving_spec)
+    hover_goal = None
+
+    say(f"approaching {moving_name} while tracking {support_name} as the placement target")
+    servo.clear()
+    for step in range(max_steps):
+        incoming = _poll(commands)
+        if incoming:
+            commands.put(incoming)
+            return False
+        scene.step()
+        rgb, depth, camera_params = scene.read_sensors()
+        tracked = perception.push_frame(rgb)
+        if tracked is not None:
+            tracks_xy, visible = tracked
+            goal = perception.approach_goal(
+                tracks_xy,
+                visible,
+                depth,
+                camera_params,
+                scene.camera_path,
+                scene.base_path,
+                group="moving",
+            )
+            if goal is None:
+                log(f"stack approach {moving_name}: fewer than 4 valid CoTracker depth points")
+            else:
+                goal.center_world[2] = goal.top_z - moving_dims[2] / 2.0
+                hover_goal = goal
+                servo.update_goal(goal, scene.joint_positions())
+                log(
+                    f"stack approach {moving_name} from CoTracker depth: "
+                    f"center {goal.center_world.round(3).tolist()} top z {goal.top_z:.3f} "
+                    f"base goal {goal.position.round(3).tolist()}"
+                )
+        _update_camera_views(
+            scene,
+            view,
+            rgb,
+            depth,
+            None if tracked is not None else perception.mask,
+            tracks_xy if tracked is not None else perception.query_xy,
+            visible if tracked is not None else None,
+        )
+        command = servo.command()
+        if command:
+            scene.set_joint_targets(command)
+        if hover_goal is None:
+            continue
+        height, horizontal = _gripper_place(scene, servo, hover_goal)
+        if step % 16 == 0:
+            log(
+                f"stack hover {moving_name}: horizontal error {horizontal:.3f} m, "
+                f"height {height:.3f} m, target {STANDOFF_Z:.3f} m, "
+                f"height error {abs(height - STANDOFF_Z):.3f} m"
+            )
+        if horizontal <= APPROACH_TOLERANCE and abs(height - STANDOFF_Z) <= APPROACH_TOLERANCE:
+            break
+    else:
+        say(f"could not reach the hover waypoint for {moving_name}")
+        return False
+
+    say(f"refining {moving_name} alignment with wrist RGB-D")
+    wrist_hover_goal = _wrist_rgbd_goal(
+        scene, perception, moving_name, hover_goal.center_world, hover_goal.quaternion, moving_dims, say
+    )
+    if wrist_hover_goal is None:
+        say(f"wrist RGB-D could not localize {moving_name}; not attempting the grasp")
+        return False
+    reached, pending = _execute_pose(
+        scene, servo, wrist_hover_goal, perception, commands, max_steps, log, view
+    )
+    if pending is not None:
+        say(f"stack phase interrupted by {pending}")
+        commands.put(pending)
+        return False
+    if not reached:
+        say(f"could not reach the wrist-refined hover pose for {moving_name}")
+        return False
+
+    grasp_alignment = _wrist_rgbd_goal(
+        scene, perception, moving_name, wrist_hover_goal.center_world, hover_goal.quaternion, moving_dims, say
+    )
+    if grasp_alignment is None:
+        say(f"wrist RGB-D could not confirm {moving_name} at grasp height; not closing the gripper")
+        return False
+    moving_center = grasp_alignment.center_world.copy()
+    grasp_world = moving_center.copy()
+    grasp_world[2] += GRIPPER_FINGER_REACH
+    base_world, base_quat = prim_world_pose(scene.base_path)
+    grasp_goal = ApproachGoal(
+        position=world_to_base(grasp_world.reshape(1, 3), base_world, base_quat)[0],
+        quaternion=grasp_alignment.quaternion.copy(),
+        center_world=moving_center.copy(),
+        top_z=grasp_alignment.top_z,
+    )
+
+    servo.set_obstacle_enabled(moving_spec["name"], False)
+    try:
+        say(f"grasping {moving_name}")
+        reached, pending = _execute_pose(scene, servo, grasp_goal, perception, commands, max_steps, log, view)
+        if pending is not None or not reached:
+            if pending is not None:
+                say(f"stack phase interrupted by {pending}")
+                commands.put(pending)
+            else:
+                say(f"could not lower the gripper to grasp {moving_name}")
+            return False
+        scene.set_gripper_closed(True)
+        _settle_tracker(
+            scene,
+            perception,
+            GRIPPER_SETTLE_STEPS,
+            view,
+            retain_groups=("support",),
+        )
+
+        moving_top = float(moving_center[2] + moving_dims[2] / 2.0)
+        lift_world = moving_center.copy()
+        lift_world[2] = moving_top + LIFT_HEIGHT
+        base_world, base_quat = prim_world_pose(scene.base_path)
+        lift_goal = ApproachGoal(
+            position=world_to_base(lift_world.reshape(1, 3), base_world, base_quat)[0],
+            quaternion=hover_goal.quaternion.copy(),
+            center_world=moving_center.copy(),
+            top_z=moving_top,
+        )
+        say(f"lifting {moving_name}")
+        reached, pending = _execute_pose(scene, servo, lift_goal, perception, commands, max_steps, log, view)
+        if pending is not None or not reached:
+            if pending is not None:
+                say(f"stack phase interrupted by {pending}")
+                commands.put(pending)
+            else:
+                say(f"could not lift {moving_name}")
+            return False
+
+        preplace_goal = None
+        place_goal = None
+        say(f"tracking {support_name} to plan the {moving_name} placement")
+        for step in range(max_steps):
+            incoming = _poll(commands)
+            if incoming:
+                commands.put(incoming)
+                return False
+            scene.step()
+            rgb, depth, camera_params = scene.read_sensors()
+            tracked = perception.push_frame(rgb)
+            if tracked is not None:
+                tracks_xy, visible = tracked
+                support_points = perception.tracked_group_points(
+                    "support", tracks_xy, visible, depth, camera_params, scene.camera_path
+                )
+                if support_points.shape[0] >= 4:
+                    preplace_goal, place_goal = _stack_placement_goals(
+                        support_points,
+                        moving_dims,
+                        scene.base_path,
+                    )
+                    servo.update_goal(preplace_goal, scene.joint_positions())
+            command = servo.command()
+            if command:
+                scene.set_joint_targets(command)
+            _update_camera_views(
+                scene,
+                view,
+                rgb,
+                depth,
+                None if tracked is not None else perception.mask,
+                tracks_xy if tracked is not None else perception.query_xy,
+                visible if tracked is not None else None,
+            )
+            if preplace_goal is not None and float(
+                np.linalg.norm(servo.hand_position(scene.joint_positions()) - preplace_goal.position)
+            ) <= APPROACH_TOLERANCE:
+                break
+        else:
+            say(f"could not reach a tracked placement waypoint above {support_name}")
+            return False
+
+        assert place_goal is not None and preplace_goal is not None
+        servo.set_obstacle_enabled(support_spec["name"], False)
+        try:
+            say(f"lowering {moving_name} onto tracked {support_name} target")
+            reached, pending = _execute_pose(
+                scene, servo, place_goal, perception, commands, max_steps, log, view
+            )
+            if pending is not None or not reached:
+                if pending is not None:
+                    say(f"stack phase interrupted by {pending}")
+                    commands.put(pending)
+                else:
+                    say(f"could not lower {moving_name} onto {support_name}")
+                return False
+            scene.set_gripper_closed(False)
+            _settle_tracker(scene, perception, GRIPPER_SETTLE_STEPS, view)
+        finally:
+            servo.set_obstacle_enabled(support_spec["name"], True)
+
+        reached, pending = _execute_pose(
+            scene, servo, preplace_goal, perception, commands, max_steps, log, view
+        )
+        if pending is not None:
+            commands.put(pending)
+            return False
+        if not reached:
+            say(f"{moving_name} was released, but the gripper could not retreat")
+            return False
+        if moving_name in {"blue", "green"}:
+            _seed_placed_cube_tracking(scene, perception, moving_name, say, view)
+        say(f"placed {moving_name} on {support_name}")
+        return True
+    finally:
+        servo.set_obstacle_enabled(moving_spec["name"], True)
+        centers = {
+            spec["name"]: prim_world_pose(scene.object_paths[spec["name"]])[0]
+            for spec in SCENE_OBJECTS
+        }
+        servo.update_block_positions(centers)
+
+
+def _stack_placement_goals(support_points: np.ndarray, moving_dims: np.ndarray, base_path: str):
+    from pseudo_vla.perception import (
+        ApproachGoal,
+        STANDOFF_Z,
+        TOP_DOWN_WXYZ,
+        prim_world_pose,
+        quat_inverse,
+        quat_multiply,
+        stack_placement_world,
+        world_to_base,
+    )
+
+    preplace_world, place_world, moving_center, support_top = stack_placement_world(
+        support_points,
+        moving_dims,
+        GRIPPER_FINGER_REACH,
+        STANDOFF_Z,
+    )
+    base_world, base_quat = prim_world_pose(base_path)
+    quaternion = quat_multiply(quat_inverse(base_quat), TOP_DOWN_WXYZ)
+    quaternion /= np.linalg.norm(quaternion)
+    preplace = ApproachGoal(
+        position=world_to_base(preplace_world.reshape(1, 3), base_world, base_quat)[0],
+        quaternion=quaternion,
+        center_world=moving_center.copy(),
+        top_z=support_top + moving_dims[2],
+    )
+    place = ApproachGoal(
+        position=world_to_base(place_world.reshape(1, 3), base_world, base_quat)[0],
+        quaternion=quaternion.copy(),
+        center_world=moving_center.copy(),
+        top_z=support_top + moving_dims[2],
+    )
+    return preplace, place
+
+
+def _settle_tracker(scene, perception, steps: int, view, retain_groups: tuple[str, ...] | None = None) -> None:
+    if retain_groups:
+        scene.step()
+        rgb, depth, _ = scene.read_sensors()
+        perception.retain_groups(rgb, retain_groups)
+        _update_camera_views(scene, view, rgb, depth, perception.mask, perception.query_xy)
+        steps -= 1
+    for _ in range(max(steps, 0)):
+        scene.step()
+        rgb, depth, _ = scene.read_sensors()
+        _update_tracker(scene, perception, rgb, depth, view)
 
 
 def _prompt_to_sam(perception, rgb: np.ndarray, prompt: str, say) -> tuple[tuple[float, float] | None, tuple[float, float, float, float] | None]:
@@ -357,6 +693,87 @@ def _prompt_to_sam(perception, rgb: np.ndarray, prompt: str, say) -> tuple[tuple
     box, score = found
     say(f"SAM box {[round(value, 1) for value in box]} score {score:.2f}")
     return None, box
+
+
+def _projected_cube_prompt(scene, rgb: np.ndarray, camera_params: dict, object_name: str, say):
+    from pseudo_vla.perception import prim_world_pose, project_world_point
+
+    center, _ = prim_world_pose(scene.object_paths[f"{object_name}_block"])
+    height, width = rgb.shape[:2]
+    point = project_world_point(
+        center,
+        camera_params,
+        scene.camera_path,
+        width,
+        height,
+    )
+    if point is None:
+        raise RuntimeError(f"The {object_name} cube is behind the environment camera")
+    x, y = (float(value) for value in point)
+    if not (0 <= x < width and 0 <= y < height):
+        raise RuntimeError(f"The projected {object_name} cube point is outside the camera image: {point.tolist()}")
+    say(f"seeding {object_name} SAM mask at projected cube center ({x:.1f}, {y:.1f})")
+    return (x, y), None
+
+
+def _seed_placed_cube_tracking(scene, perception, object_name: str, say, view) -> None:
+    scene.step()
+    rgb, depth, camera_params = scene.read_sensors()
+    point, _ = _projected_cube_prompt(scene, rgb, camera_params, object_name, say)
+    perception.segment_groups(rgb, {"placed": (point, None)})
+    say(f"dropped stale CoTracker points; tracking the placed {object_name} cube")
+    _update_camera_views(scene, view, rgb, depth, perception.mask, perception.query_xy)
+
+
+def _wrist_rgbd_goal(scene, perception, object_name, center_hint, quaternion, dims, say):
+    from pseudo_vla.perception import (
+        ApproachGoal,
+        STANDOFF_Z,
+        mask_depth_points,
+        prim_world_pose,
+        project_world_point,
+        tracked_surface_top,
+        world_to_base,
+    )
+
+    rgb, depth, camera_params = scene.read_wrist_sensors()
+    height, width = depth.shape[:2]
+    point = project_world_point(
+        center_hint,
+        camera_params,
+        scene.wrist_camera_path,
+        width,
+        height,
+    )
+    if point is None or not (0 <= point[0] < width and 0 <= point[1] < height):
+        say(f"{object_name} is outside the wrist camera view")
+        return None
+
+    mask = perception.segment_mask(rgb, (float(point[0]), float(point[1])))
+    points = mask_depth_points(mask, depth, camera_params, scene.wrist_camera_path)
+    if points.shape[0] < 4:
+        say(f"wrist RGB-D found only {points.shape[0]} valid {object_name} points")
+        return None
+
+    center_world = np.median(points, axis=0)
+    top_z = tracked_surface_top(points)
+    center_world[2] = top_z - dims[2] / 2.0
+    goal_world = np.array(
+        [center_world[0], center_world[1], top_z + STANDOFF_Z],
+        dtype=np.float64,
+    )
+    base_world, base_quat = prim_world_pose(scene.base_path)
+    goal_base = world_to_base(goal_world.reshape(1, 3), base_world, base_quat)[0]
+    say(
+        f"wrist RGB-D aligned {object_name}: center {center_world.round(3).tolist()}, "
+        f"top z {top_z:.3f} from {points.shape[0]} depth points"
+    )
+    return ApproachGoal(
+        position=goal_base,
+        quaternion=quaternion.copy(),
+        center_world=center_world,
+        top_z=top_z,
+    )
 
 
 def _numbers(prompt: str) -> list[float] | None:
@@ -380,8 +797,8 @@ def _home(scene, perception, servo, commands, max_steps: int, say, log, view) ->
         if incoming:
             return incoming
         scene.step()
-        rgb, _, _ = scene.read_sensors()
-        _update_tracker(perception, rgb, view)
+        rgb, depth, _ = scene.read_sensors()
+        _update_tracker(scene, perception, rgb, depth, view)
         command = servo.command()
         if command:
             scene.set_joint_targets(command)
@@ -401,15 +818,37 @@ def _home(scene, perception, servo, commands, max_steps: int, say, log, view) ->
     return None
 
 
-def _update_tracker(perception, rgb: np.ndarray, view) -> None:
+def _update_tracker(scene, perception, rgb: np.ndarray, depth: np.ndarray, view) -> None:
     tracked = perception.push_frame(rgb)
     if view is None:
         return
     if tracked is None:
-        view.update(rgb, perception.mask, perception.query_xy)
+        _update_camera_views(scene, view, rgb, depth, perception.mask, perception.query_xy)
     else:
         points, visible = tracked
-        view.update(rgb, None, points, visible)
+        _update_camera_views(scene, view, rgb, depth, None, points, visible)
+
+
+def _update_camera_views(
+    scene,
+    view,
+    environment_rgb: np.ndarray,
+    environment_depth: np.ndarray,
+    mask: np.ndarray | None = None,
+    points_xy: np.ndarray | None = None,
+    visible: np.ndarray | None = None,
+) -> None:
+    if view is None:
+        return
+    _, wrist_depth, _ = scene.read_wrist_sensors()
+    view.update(
+        environment_rgb,
+        mask,
+        points_xy,
+        visible,
+        environment_depth=environment_depth,
+        wrist_depth=wrist_depth,
+    )
 
 
 def _open_gripper_for_next_command(scene, perception, say, view) -> None:
@@ -417,8 +856,8 @@ def _open_gripper_for_next_command(scene, perception, say, view) -> None:
     scene.set_gripper_closed(False)
     for _ in range(GRIPPER_SETTLE_STEPS):
         scene.step()
-        rgb, _, _ = scene.read_sensors()
-        _update_tracker(perception, rgb, view)
+        rgb, depth, _ = scene.read_sensors()
+        _update_tracker(scene, perception, rgb, depth, view)
 
 
 def _gripper_place(scene, servo, goal) -> tuple[float, float]:

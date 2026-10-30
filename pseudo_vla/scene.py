@@ -23,9 +23,9 @@ SCENE_OBJECTS = (
     {"name": "blue_block", "color": (0.05, 0.15, 0.95), "xy": (0.22, -0.28)},
 )
 ENV_CAMERA_PATH = "/World/EnvCamera"
-# In front of the arm (it faces +Y) and a little lower, nearer the tabletop.
-ENV_CAMERA_EYE = np.array([0.0, 1.15, 0.90], dtype=np.float64)
-ENV_CAMERA_TARGET = np.array([0.0, -0.35, 0.30], dtype=np.float64)
+# In front of the arm (it faces +Y), close enough to clearly resolve the blocks.
+ENV_CAMERA_EYE = np.array([0.0, 0.35, 0.65], dtype=np.float64)
+ENV_CAMERA_TARGET = np.array([0.0, -0.35, 0.20], dtype=np.float64)
 ENV_RESOLUTION = (480, 480)
 WRIST_RESOLUTION = (256, 256)
 # Pose on panda_hand. Offset to the side of the palm and pitched down the fingers
@@ -107,6 +107,9 @@ class FrankaScene:
     rgb_annot: object
     depth_annot: object
     camera_annot: object
+    wrist_rgb_annot: object
+    wrist_depth_annot: object
+    wrist_camera_annot: object
     gripper_closed: bool = False
 
     def step(self) -> None:
@@ -115,22 +118,17 @@ class FrankaScene:
     def read_sensors(self) -> tuple[np.ndarray, np.ndarray, dict]:
         import omni.replicator.core as rep
 
-        rgb = self.rgb_annot.get_data()
-        depth = self.depth_annot.get_data()
-        params = self.camera_annot.get_data()
-        if _empty(rgb) or _empty(depth):
-            rep.orchestrator.step()
-            rgb = self.rgb_annot.get_data()
-            depth = self.depth_annot.get_data()
-            params = self.camera_annot.get_data()
-        rgb = np.asarray(rgb)
-        depth = np.asarray(depth)
-        if rgb.ndim == 3 and rgb.shape[-1] == 4:
-            rgb = rgb[..., :3]
-        depth = np.squeeze(depth).astype(np.float64)
-        if not isinstance(params, dict):
-            params = {}
-        return np.ascontiguousarray(rgb), depth, params
+        return _read_rgbd(self.rgb_annot, self.depth_annot, self.camera_annot, rep)
+
+    def read_wrist_sensors(self) -> tuple[np.ndarray, np.ndarray, dict]:
+        import omni.replicator.core as rep
+
+        return _read_rgbd(
+            self.wrist_rgb_annot,
+            self.wrist_depth_annot,
+            self.wrist_camera_annot,
+            rep,
+        )
 
     def dof_index(self, name: str) -> int | None:
         names = list(self.arm.dof_names)
@@ -174,6 +172,25 @@ class FrankaScene:
         positions = np.asarray(values, dtype=np.float32).reshape(1, -1)
         self.arm.set_dof_positions(positions, dof_indices=indices)
         self.arm.set_dof_position_targets(positions, dof_indices=indices)
+
+
+def _read_rgbd(rgb_annot, depth_annot, camera_annot, rep) -> tuple[np.ndarray, np.ndarray, dict]:
+    rgb = rgb_annot.get_data()
+    depth = depth_annot.get_data()
+    params = camera_annot.get_data()
+    if _empty(rgb) or _empty(depth):
+        rep.orchestrator.step()
+        rgb = rgb_annot.get_data()
+        depth = depth_annot.get_data()
+        params = camera_annot.get_data()
+    rgb = np.asarray(rgb)
+    depth = np.asarray(depth)
+    if rgb.ndim == 3 and rgb.shape[-1] == 4:
+        rgb = rgb[..., :3]
+    depth = np.squeeze(depth).astype(np.float64)
+    if not isinstance(params, dict):
+        params = {}
+    return np.ascontiguousarray(rgb), depth, params
 
 
 def _empty(data) -> bool:
@@ -429,12 +446,19 @@ def build_scene(app) -> FrankaScene:
     for _ in range(15):
         app.update()
     render_product = rep.create.render_product(ENV_CAMERA_PATH, ENV_RESOLUTION)
+    wrist_render_product = rep.create.render_product(wrist_camera_path, WRIST_RESOLUTION)
     rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
     depth_annot = rep.AnnotatorRegistry.get_annotator("distance_to_image_plane")
     camera_annot = rep.AnnotatorRegistry.get_annotator("camera_params")
+    wrist_rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
+    wrist_depth_annot = rep.AnnotatorRegistry.get_annotator("distance_to_image_plane")
+    wrist_camera_annot = rep.AnnotatorRegistry.get_annotator("camera_params")
     rgb_annot.attach(render_product)
     depth_annot.attach(render_product)
     camera_annot.attach(render_product)
+    wrist_rgb_annot.attach(wrist_render_product)
+    wrist_depth_annot.attach(wrist_render_product)
+    wrist_camera_annot.attach(wrist_render_product)
 
     scene = FrankaScene(
         app=app,
@@ -447,6 +471,9 @@ def build_scene(app) -> FrankaScene:
         rgb_annot=rgb_annot,
         depth_annot=depth_annot,
         camera_annot=camera_annot,
+        wrist_rgb_annot=wrist_rgb_annot,
+        wrist_depth_annot=wrist_depth_annot,
+        wrist_camera_annot=wrist_camera_annot,
     )
     scene.set_home()
     _log("home pose set")
