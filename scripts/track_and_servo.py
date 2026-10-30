@@ -20,7 +20,11 @@ if str(ROOT) not in sys.path:
 
 from pseudo_vla.scene import launch
 
-ARRIVED_DISTANCE = 0.10
+# Vertical gap from the gripper down to the top of the tracked object.
+ARRIVED_DISTANCE = 0.30
+# The gripper must also be over that object. Height alone matches the next target.
+OVER_OBJECT_DISTANCE = 0.08
+HOME_DISTANCE = 0.02
 QUIT_COMMANDS = {"quit", "exit", "q"}
 
 
@@ -69,11 +73,11 @@ def run(app, args: argparse.Namespace) -> None:
         say("loading perception")
         perception = Perception()
         say("loading cuRobo")
-        servo = ArmServo()
+        base_world, base_quat = prim_world_pose(scene.base_path)
+        servo = ArmServo(base_world, base_quat)
 
         joints = scene.joint_positions()
         hand_world, _ = prim_world_pose(scene.hand_path)
-        base_world, base_quat = prim_world_pose(scene.base_path)
         hand_base = world_to_base(hand_world.reshape(1, 3), base_world, base_quat)[0]
         servo.check_kinematics(joints, hand_base)
         servo.remember_home(joints)
@@ -86,7 +90,7 @@ def run(app, args: argparse.Namespace) -> None:
             view = PerceptionWindows(scene.wrist_camera_path, WRIST_RESOLUTION, ENV_RESOLUTION)
             say("opened Wrist Camera and SAM + CoTracker windows")
 
-        say("Type anything for SAM, such as \"red cube\" or \"blue cylinder\".")
+        say("Type anything for SAM, such as \"mustard bottle\" or \"tomato soup can\".")
         say("Two numbers are a pixel. Four numbers are a box.")
         say("Commands: home, quit")
         threading.Thread(target=read_commands, daemon=True).start()
@@ -185,7 +189,7 @@ def _move_to_prompt(scene, perception, servo, prompt, commands, max_steps: int, 
                     f"nearest {nearest_name} {nearest_world.round(3).tolist()} error {error:.3f} m "
                     f"goal {goal.position.round(3).tolist()}"
                 )
-                servo.update_goal(goal, scene.joint_positions())
+                servo.update_goal(goal, scene.joint_positions(), ignore_name=nearest_name)
         if view is not None:
             if last_points is None:
                 view.update(rgb, perception.mask, perception.query_xy)
@@ -196,17 +200,16 @@ def _move_to_prompt(scene, perception, servo, prompt, commands, max_steps: int, 
             scene.set_joint_targets(command)
         if goal is None:
             continue
-        hand = servo.hand_position(scene.joint_positions())
-        if float(np.linalg.norm(hand - goal.position)) <= ARRIVED_DISTANCE:
-            say(f"reached {prompt}")
+        height, horizontal = _gripper_place(scene, servo, goal)
+        if horizontal <= OVER_OBJECT_DISTANCE and height <= ARRIVED_DISTANCE:
+            say(f"reached {prompt}, gripper {height:.3f} m above the top")
             servo.clear()
             return None
     if goal is None:
         say(f"no 3D goal for {prompt}. Check outputs/frame0_overlay.png")
     else:
-        hand = servo.hand_position(scene.joint_positions())
-        distance = float(np.linalg.norm(hand - goal.position))
-        say(f"stopped {distance:.3f} m from {prompt}")
+        height, horizontal = _gripper_place(scene, servo, goal)
+        say(f"stopped {horizontal:.3f} m to the side and {height:.3f} m above {prompt}")
     return None
 
 
@@ -259,7 +262,7 @@ def _home(scene, servo, commands, max_steps: int, say, log, view) -> str | None:
             scene.set_joint_targets(HOME_ARM)
         hand = servo.hand_position(scene.joint_positions())
         distance = float(np.linalg.norm(hand - goal.position))
-        if distance <= ARRIVED_DISTANCE:
+        if distance <= HOME_DISTANCE:
             say("at home")
             servo.clear()
             return None
@@ -269,6 +272,18 @@ def _home(scene, servo, commands, max_steps: int, say, log, view) -> str | None:
     say("home motion finished; holding the home joint targets")
     servo.clear()
     return None
+
+
+def _gripper_place(scene, servo, goal) -> tuple[float, float]:
+    """Gripper height above the object top, and horizontal distance to its tracked center."""
+    from pseudo_vla.perception import base_to_world, prim_world_pose
+
+    hand = servo.hand_position(scene.joint_positions())
+    base_world, base_quat = prim_world_pose(scene.base_path)
+    hand_world = base_to_world(hand.reshape(1, 3), base_world, base_quat)[0]
+    height = float(hand_world[2] - goal.top_z)
+    horizontal = float(np.linalg.norm(hand_world[:2] - goal.median_world[:2]))
+    return height, horizontal
 
 
 def _nearest_object(median_world: np.ndarray) -> tuple[str, np.ndarray, float]:

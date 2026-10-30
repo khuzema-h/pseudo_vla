@@ -1,4 +1,4 @@
-"""Isaac Sim Franka scene with a wrist camera and a fixed environment camera."""
+"""Isaac Sim Franka scene in the simple room, with a wrist camera and an environment camera."""
 
 from __future__ import annotations
 
@@ -7,20 +7,25 @@ from dataclasses import dataclass
 
 import numpy as np
 
-# Solid pedestal whose top is the table surface. The cuRobo cuboid uses the same box.
-TABLE_DIMS = np.array([0.70, 0.55, 0.40], dtype=np.float64)
-TABLE_CENTER = np.array([0.55, 0.0, 0.20], dtype=np.float64)
-TABLE_TOP_Z = float(TABLE_CENTER[2] + TABLE_DIMS[2] / 2.0)
-# Distinct shapes and colors spread across the tabletop so the environment camera can tell them apart.
+# Bounds of table_low in Isaac's Simple Room. The cuRobo cuboid uses the same box.
+TABLE_MIN = np.array([-1.592, -0.813, -0.77], dtype=np.float64)
+TABLE_MAX = np.array([1.593, 0.813, 0.01], dtype=np.float64)
+TABLE_DIMS = TABLE_MAX - TABLE_MIN
+TABLE_CENTER = (TABLE_MIN + TABLE_MAX) / 2.0
+TABLE_TOP_Z = float(TABLE_MAX[2])
+# The arm stands on the near edge of the table and faces +Y, toward the props.
+ARM_POSITION = (0.0, -0.60, TABLE_TOP_Z + 0.002)
+# YCB props from the Isaac Props folder, in front of the base but close enough to reach.
 SCENE_OBJECTS = (
-    {"name": "red_cube", "kind": "cube", "size": 0.05, "xy": (0.42, -0.14), "color": (0.90, 0.12, 0.10)},
-    {"name": "yellow_cube", "kind": "cube", "size": 0.05, "xy": (0.68, 0.14), "color": (0.92, 0.78, 0.10)},
-    {"name": "blue_cylinder", "kind": "cylinder", "radius": 0.03, "height": 0.08, "xy": (0.58, 0.00), "color": (0.12, 0.28, 0.85)},
-    {"name": "green_sphere", "kind": "sphere", "radius": 0.035, "xy": (0.50, 0.16), "color": (0.10, 0.65, 0.22)},
+    {"name": "cracker_box", "usd": "/Isaac/Props/YCB/Axis_Aligned_Physics/003_cracker_box.usd", "xy": (-0.25, -0.35)},
+    {"name": "sugar_box", "usd": "/Isaac/Props/YCB/Axis_Aligned_Physics/004_sugar_box.usd", "xy": (0.12, -0.25)},
+    {"name": "tomato_soup_can", "usd": "/Isaac/Props/YCB/Axis_Aligned_Physics/005_tomato_soup_can.usd", "xy": (0.30, -0.07)},
+    {"name": "mustard_bottle", "usd": "/Isaac/Props/YCB/Axis_Aligned_Physics/006_mustard_bottle.usd", "xy": (-0.05, -0.03)},
 )
 ENV_CAMERA_PATH = "/World/EnvCamera"
-ENV_CAMERA_EYE = np.array([1.05, -0.70, 0.95], dtype=np.float64)
-ENV_CAMERA_TARGET = np.array([0.55, 0.0, TABLE_TOP_Z], dtype=np.float64)
+# In front of the arm (it faces +Y) and a little lower, nearer the tabletop.
+ENV_CAMERA_EYE = np.array([0.0, 1.15, 0.90], dtype=np.float64)
+ENV_CAMERA_TARGET = np.array([0.0, -0.35, 0.30], dtype=np.float64)
 ENV_RESOLUTION = (480, 480)
 WRIST_RESOLUTION = (256, 256)
 # Pose on panda_hand. Offset to the side of the palm and pitched down the fingers
@@ -291,49 +296,111 @@ def _look_at_wxyz(eye: np.ndarray, target: np.ndarray) -> np.ndarray:
 
 
 def object_center(spec: dict) -> np.ndarray:
-    if spec["kind"] == "cube":
-        z = TABLE_TOP_Z + spec["size"] / 2.0
-    elif spec["kind"] == "cylinder":
-        z = TABLE_TOP_Z + spec["height"] / 2.0
-    else:
-        z = TABLE_TOP_Z + spec["radius"]
-    return np.array([spec["xy"][0], spec["xy"][1], z], dtype=np.float64)
+    return np.asarray(spec["center"], dtype=np.float64)
 
 
-def _spawn_object(spec: dict) -> str:
-    from isaacsim.core.experimental.objects import Cube, Cylinder, Sphere
-    from isaacsim.core.experimental.prims import GeomPrim, RigidPrim
+def object_dims(spec: dict) -> np.ndarray:
+    return np.asarray(spec["dims"], dtype=np.float64)
+
+
+def _record_prop_bounds(spec: dict) -> None:
+    """Store the prop's world-aligned center and size for the cuRobo cuboid."""
+    import omni.usd
+    from pxr import Usd, UsdGeom
+
+    stage = omni.usd.get_context().get_stage()
+    cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render"])
+    box = cache.ComputeWorldBound(stage.GetPrimAtPath(f"/World/{spec['name']}")).ComputeAlignedBox()
+    minimum, maximum = box.GetMin(), box.GetMax()
+    spec["center"] = np.array(
+        [float(minimum[i] + maximum[i]) / 2.0 for i in range(3)],
+        dtype=np.float64,
+    )
+    spec["dims"] = np.array([float(maximum[i] - minimum[i]) for i in range(3)], dtype=np.float64)
+    _log(f"prop {spec['name']} center {spec['center'].round(3).tolist()} dims {spec['dims'].round(3).tolist()}")
+
+
+def _place_arm(arm_path: str) -> None:
+    """Stand the Franka on the table, facing the props."""
+    yaw = np.pi / 2.0
+    quat = (float(np.cos(yaw / 2.0)), 0.0, 0.0, float(np.sin(yaw / 2.0)))
+    _author_camera_pose(arm_path, ARM_POSITION, quat)
+
+
+def _collide_room_table() -> None:
+    """Give the room table a static box collider so props rest on it."""
+    import omni.usd
+    from isaacsim.core.experimental.prims import GeomPrim
+    from pxr import UsdPhysics
+
+    mesh_path = "/World/SimpleRoom/table_low_327/table_low"
+    GeomPrim(mesh_path).apply_collision_apis()
+    prim = omni.usd.get_context().get_stage().GetPrimAtPath(mesh_path)
+    api = UsdPhysics.MeshCollisionAPI(prim)
+    api.CreateApproximationAttr("boundingCube")
+
+
+def _upside_down_quat(extents: np.ndarray) -> tuple[float, float, float, float]:
+    """Rotate so the prop's longest side points down."""
+    axis = int(np.argmax(extents))
+    half = np.pi / 4.0
+    if axis == 2:
+        # Rx(180) takes local +Z onto world -Z.
+        return (0.0, 1.0, 0.0, 0.0)
+    if axis == 0:
+        # Ry(90) takes local +X onto world -Z.
+        return (float(np.cos(half)), 0.0, float(np.sin(half)), 0.0)
+    # Rx(-90) takes local +Y onto world -Z.
+    return (float(np.cos(-half)), float(np.sin(-half)), 0.0, 0.0)
+
+
+def _place_prop(app, assets: str, spec: dict) -> str:
+    """Reference a prop, flip it upside down, and sit it on the table."""
+    import omni.usd
+    import isaacsim.core.experimental.utils.stage as stage_utils
+    from pxr import Usd, UsdGeom
 
     path = f"/World/{spec['name']}"
-    center = object_center(spec)
-    color = [list(spec["color"])]
-    if spec["kind"] == "cube":
-        Cube(path, sizes=spec["size"], positions=center.tolist(), colors=color)
-    elif spec["kind"] == "cylinder":
-        Cylinder(
-            path,
-            radii=spec["radius"],
-            heights=spec["height"],
-            axes="Z",
-            positions=center.tolist(),
-            colors=color,
-        )
-    else:
-        Sphere(path, radii=spec["radius"], positions=center.tolist(), colors=color)
-    GeomPrim(path).apply_collision_apis()
-    RigidPrim(path, masses=[0.1])
+    stage_utils.add_reference_to_stage(assets + spec["usd"], path)
+    stage = omni.usd.get_context().get_stage()
+    stage.Load(path)
+    xy = spec["xy"]
+    origin = (float(xy[0]), float(xy[1]), TABLE_TOP_Z)
+    _author_camera_pose(path, origin, (1.0, 0.0, 0.0, 0.0))
+    for _ in range(5):
+        app.update()
+    cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render"])
+    box = cache.ComputeWorldBound(stage.GetPrimAtPath(path)).ComputeAlignedBox()
+    minimum, maximum = box.GetMin(), box.GetMax()
+    extents = np.array([float(maximum[i] - minimum[i]) for i in range(3)], dtype=np.float64)
+    if float(extents[2]) < 0.01 and float(np.max(extents)) < 0.01:
+        names = [child.GetName() for child in stage.GetPrimAtPath(path).GetChildren()]
+        raise RuntimeError(f"{spec['usd']} has no mesh bounds; children {names}")
+    quat = _upside_down_quat(extents)
+    _author_camera_pose(path, origin, quat)
+    for _ in range(2):
+        app.update()
+    cache.Clear()
+    box = cache.ComputeWorldBound(stage.GetPrimAtPath(path)).ComputeAlignedBox()
+    minimum = box.GetMin()
+    z = TABLE_TOP_Z + (TABLE_TOP_Z - float(minimum[2])) + 0.005
+    _author_camera_pose(path, (float(xy[0]), float(xy[1]), z), quat)
+    for _ in range(2):
+        app.update()
+    cache.Clear()
+    box = cache.ComputeWorldBound(stage.GetPrimAtPath(path)).ComputeAlignedBox()
+    _record_prop_bounds(spec)
     return path
 
 
 def build_scene(app) -> FrankaScene:
-    """Load the Franka, table, several objects, the wrist camera, and the environment camera."""
+    """Load the simple room, Franka, YCB props, wrist camera, and environment camera."""
     import omni.replicator.core as rep
     import isaacsim.core.experimental.utils.app as app_utils
     import isaacsim.core.experimental.utils.stage as stage_utils
-    from isaacsim.core.experimental.objects import Camera, Cube, DomeLight, GroundPlane
-    from isaacsim.core.experimental.prims import Articulation, GeomPrim
+    from isaacsim.core.experimental.objects import Camera
+    from isaacsim.core.experimental.prims import Articulation
     from isaacsim.storage.native import get_assets_root_path
-    from pxr import UsdLux
 
     _log("new stage")
     app_utils.enable_extension("omni.replicator.core")
@@ -344,28 +411,19 @@ def build_scene(app) -> FrankaScene:
     assets = get_assets_root_path()
     if not assets:
         raise RuntimeError("Isaac Sim assets root was not found")
+    room = assets + "/Isaac/Environments/Simple_Room/simple_room.usd"
+    stage_utils.add_reference_to_stage(room, "/World/SimpleRoom")
+    _log(f"referenced {room}")
+    _collide_room_table()
+
     usd = assets + "/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"
     stage_utils.add_reference_to_stage(usd, "/World/Arm")
+    _place_arm("/World/Arm")
     _log(f"referenced {usd}")
 
-    GroundPlane("/World/Ground")
-    DomeLight("/World/DomeLight")
+    object_paths = {spec["name"]: _place_prop(app, assets, spec) for spec in SCENE_OBJECTS}
+
     import omni.usd
-
-    light_prim = omni.usd.get_context().get_stage().GetPrimAtPath("/World/DomeLight")
-    light = UsdLux.DomeLight(light_prim)
-    light.CreateIntensityAttr().Set(1000.0)
-
-    Cube(
-        "/World/Table",
-        sizes=1.0,
-        scales=TABLE_DIMS.tolist(),
-        positions=TABLE_CENTER.tolist(),
-        colors=[[0.45, 0.45, 0.48]],
-    )
-    GeomPrim("/World/Table").apply_collision_apis()
-
-    object_paths = {spec["name"]: _spawn_object(spec) for spec in SCENE_OBJECTS}
 
     stage = omni.usd.get_context().get_stage()
     hand_path = _find_prim_path(stage, "panda_hand")
@@ -382,7 +440,7 @@ def build_scene(app) -> FrankaScene:
     env_camera = Camera(ENV_CAMERA_PATH)
     env_camera.set_focal_lengths([18.0])
     env_camera.set_apertures(horizontal_apertures=[20.955], vertical_apertures=[20.955])
-    env_camera.set_clipping_ranges(near_distances=[0.05], far_distances=[5.0])
+    env_camera.set_clipping_ranges(near_distances=[0.05], far_distances=[15.0])
     env_quat = _look_at_wxyz(ENV_CAMERA_EYE, ENV_CAMERA_TARGET)
     _author_camera_pose(ENV_CAMERA_PATH, tuple(float(value) for value in ENV_CAMERA_EYE), tuple(float(value) for value in env_quat))
     _add_camera_marker(ENV_CAMERA_PATH, (0.15, 0.75, 0.95), 0.06)
@@ -415,6 +473,8 @@ def build_scene(app) -> FrankaScene:
     _log("home pose set")
     for _ in range(20):
         scene.step()
+    for spec in SCENE_OBJECTS:
+        _record_prop_bounds(spec)
     _show_camera_gizmos()
     _log("scene ready")
     return scene

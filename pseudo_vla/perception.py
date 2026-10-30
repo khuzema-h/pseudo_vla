@@ -25,6 +25,7 @@ class ApproachGoal:
     position: np.ndarray
     quaternion: np.ndarray
     median_world: np.ndarray
+    top_z: float
 
 
 def quat_multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -60,6 +61,11 @@ def quat_to_matrix(q: np.ndarray) -> np.ndarray:
 def world_to_base(points: np.ndarray, base_position: np.ndarray, base_quat_wxyz: np.ndarray) -> np.ndarray:
     rotation = quat_to_matrix(base_quat_wxyz)
     return (rotation.T @ (points - base_position).T).T
+
+
+def base_to_world(points: np.ndarray, base_position: np.ndarray, base_quat_wxyz: np.ndarray) -> np.ndarray:
+    rotation = quat_to_matrix(base_quat_wxyz)
+    return (rotation @ points.T).T + base_position
 
 
 def prim_world_pose(path: str) -> tuple[np.ndarray, np.ndarray]:
@@ -218,12 +224,13 @@ class Perception:
         if points.shape[0] < MIN_TRACK_POINTS:
             return None
         median_world = np.median(points, axis=0)
+        top_z = float(np.max(points[:, 2]))
         base_position, base_quat = prim_world_pose(base_path)
         goal_world = median_world + np.array([0.0, 0.0, STANDOFF_Z], dtype=np.float64)
         goal_base = world_to_base(goal_world.reshape(1, 3), base_position, base_quat)[0]
         goal_quat = quat_multiply(quat_inverse(base_quat), TOP_DOWN_WXYZ)
         goal_quat = goal_quat / np.linalg.norm(goal_quat)
-        return ApproachGoal(position=goal_base, quaternion=goal_quat, median_world=median_world)
+        return ApproachGoal(position=goal_base, quaternion=goal_quat, median_world=median_world, top_z=top_z)
 
 
 def sample_mask_points(mask: np.ndarray, count: int = 16) -> np.ndarray:
