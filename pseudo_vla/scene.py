@@ -45,6 +45,10 @@ HOME_FINGERS = {
     "panda_finger_joint1": 0.04,
     "panda_finger_joint2": 0.04,
 }
+CLOSED_FINGERS = {
+    "panda_finger_joint1": 0.0,
+    "panda_finger_joint2": 0.0,
+}
 ARM_JOINT_NAMES = list(HOME_ARM)
 
 
@@ -103,6 +107,7 @@ class FrankaScene:
     rgb_annot: object
     depth_annot: object
     camera_annot: object
+    gripper_closed: bool = False
 
     def step(self) -> None:
         self.app.update()
@@ -150,6 +155,11 @@ class FrankaScene:
         if not names:
             return
         self.arm.set_dof_position_targets(np.asarray(values, dtype=np.float32).reshape(1, -1), dof_indices=names)
+
+    def set_gripper_closed(self, closed: bool) -> None:
+        targets = CLOSED_FINGERS if closed else HOME_FINGERS
+        self.set_joint_targets(targets)
+        self.gripper_closed = closed
 
     def set_home(self) -> None:
         targets = {**HOME_ARM, **HOME_FINGERS}

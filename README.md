@@ -96,7 +96,7 @@ The first Kit launch is slow. Later launches are much faster. When the prompt ap
 - Type `home` to plan back to the pose the hand had at startup.
 - Type `quit` to close Kit.
 
-A move ends when the gripper is centered over the selected block and within 2 cm of the 10 cm hover waypoint. The sim keeps running after that. Typing another command during a move interrupts it.
+A move approaches the selected block, lowers the open fingers around its center, closes the gripper, and lifts it to 20 cm above the block. It holds the block while waiting and opens only when the next non-quit command arrives. The target block is omitted from cuRobo collision checks only during intentional contact; the table and other blocks remain obstacles.
 
 Useful flags:
 
@@ -112,8 +112,9 @@ Logs for each step go to `outputs/run.log`. The first segmented frame is saved t
 
 - One process shares the GPU across Isaac Sim, SAM 2, CoTracker3, OWL-ViT, and cuRobo.
 - SAM 2 and OWL-ViT load once when perception starts and stay resident on the GPU between prompts.
+- CoTracker continues receiving camera frames while idle and during motion, grasping, and lifting; it is reseeded when a new prompt selects an object.
 - Perception reads the environment camera. The wrist camera is a view of the gripper, not the finder.
-- Tracked points are unprojected with the depth image. The approach pose is 10 cm above the median point, with the hand pointing down.
-- The arm replans when the 3D goal moves. All blocks, including the current target, plus the table, are collision cuboids in the robot base frame.
-- The gripper does not close. The motion stops above the object.
-- The scene provides movable blocks, but the current controller does not pick up or stack them.
+- Tracked points identify the selected block, then the scene block bounds define a centered 10 cm hover pose with the hand pointing down.
+- The arm replans when the 3D goal moves. All blocks, including the current target, plus the table, are collision cuboids during approach. Only the selected block is temporarily omitted for intentional finger contact and lifting.
+- After approach, the gripper closes around the selected block and attempts a 20 cm lift. It keeps holding the block until another command arrives, then opens before handling that command. The controller checks whether the block followed the gripper.
+- The controller does not yet place or stack a grasped block.

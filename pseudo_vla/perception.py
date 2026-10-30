@@ -210,6 +210,8 @@ class Perception:
             self.sam.reset_predictor()
 
     def push_frame(self, rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+        if self.queries is None:
+            return None
         image = np.ascontiguousarray(rgb)
         if image.dtype != np.uint8:
             image = np.clip(image, 0, 255).astype(np.uint8)
@@ -221,6 +223,8 @@ class Perception:
         chunk = np.stack(self.frames[self._window_start : end], axis=0)
         tracks, visible = self.tracker(video_chunk=_rgb_tensor(chunk), add_support_grid=True)
         self._window_start += self.tracker.step
+        self.frames = self.frames[self._window_start :]
+        self._window_start = 0
         tracks_np = tracks[0, -1].detach().cpu().numpy()
         visible_np = visible[0, -1].detach().cpu().numpy().astype(bool)
         return tracks_np, visible_np

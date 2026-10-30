@@ -22,6 +22,9 @@ from pseudo_vla.scene import launch
 
 APPROACH_TOLERANCE = 0.02
 HOME_DISTANCE = 0.02
+GRIPPER_FINGER_REACH = 0.11
+GRIPPER_SETTLE_STEPS = 45
+LIFT_HEIGHT = 0.20
 QUIT_COMMANDS = {"quit", "exit", "q"}
 
 
@@ -100,9 +103,8 @@ def run(app, args: argparse.Namespace) -> None:
                     print("> ", end="", flush=True)
                     prompt_shown = True
                 scene.step()
-                if view is not None:
-                    rgb, _, _ = scene.read_sensors()
-                    view.update(rgb)
+                rgb, _, _ = scene.read_sensors()
+                _update_tracker(perception, rgb, view)
                 pending = _poll(commands)
                 continue
 
@@ -114,8 +116,10 @@ def run(app, args: argparse.Namespace) -> None:
             if command in QUIT_COMMANDS:
                 say("closing")
                 return
+            if scene.gripper_closed:
+                _open_gripper_for_next_command(scene, perception, say, view)
             if command == "home":
-                pending = _home(scene, servo, commands, args.max_steps, say, log, view)
+                pending = _home(scene, perception, servo, commands, args.max_steps, say, log, view)
                 continue
             pending = _move_to_prompt(scene, perception, servo, command, commands, args.max_steps, say, log, view)
     except Exception:
@@ -137,13 +141,14 @@ def _poll(commands: queue.Queue[str]) -> str | None:
 
 
 def _move_to_prompt(scene, perception, servo, prompt, commands, max_steps: int, say, log, view) -> str | None:
-    from pseudo_vla.perception import STANDOFF_Z, prim_world_pose, save_overlay, world_to_base
+    from pseudo_vla.perception import ApproachGoal, STANDOFF_Z, prim_world_pose, save_overlay, world_to_base
     from pseudo_vla.scene import object_center, object_dims
 
     say(f"moving to {prompt}")
     servo.clear()
     started = False
     goal = None
+    target_spec = None
     last_points = None
     last_visible = None
     for step in range(max_steps):
@@ -182,6 +187,7 @@ def _move_to_prompt(scene, perception, servo, prompt, commands, max_steps: int, 
             else:
                 goal = updated
                 nearest_spec, error = _nearest_object(goal.center_world)
+                target_spec = nearest_spec
                 nearest_world = object_center(nearest_spec)
                 dims = object_dims(nearest_spec)
                 top_z = float(nearest_world[2] + dims[2] / 2.0)
@@ -215,14 +221,124 @@ def _move_to_prompt(scene, perception, servo, prompt, commands, max_steps: int, 
         height, horizontal = _gripper_place(scene, servo, goal)
         if horizontal <= APPROACH_TOLERANCE and abs(height - STANDOFF_Z) <= APPROACH_TOLERANCE:
             say(f"reached {prompt}, gripper {height:.3f} m above the top")
-            servo.clear()
-            return None
+            if target_spec is None:
+                raise RuntimeError("Reached approach waypoint without a selected block")
+            hover_goal = ApproachGoal(
+                position=goal.position.copy(),
+                quaternion=goal.quaternion.copy(),
+                center_world=goal.center_world.copy(),
+                top_z=goal.top_z,
+            )
+            return _grasp_and_lift(
+                scene,
+                servo,
+                target_spec,
+                hover_goal,
+                perception,
+                commands,
+                max_steps,
+                say,
+                log,
+                view,
+            )
     if goal is None:
         say(f"no 3D goal for {prompt}. Check outputs/frame0_overlay.png")
     else:
         height, horizontal = _gripper_place(scene, servo, goal)
         say(f"stopped {horizontal:.3f} m to the side and {height:.3f} m above {prompt}")
     return None
+
+
+def _grasp_and_lift(scene, servo, spec, hover_goal, perception, commands, max_steps: int, say, log, view) -> str | None:
+    from pseudo_vla.perception import ApproachGoal, prim_world_pose, world_to_base
+    from pseudo_vla.scene import object_center, object_dims
+
+    center_world = object_center(spec)
+    grasp_world = center_world.copy()
+    grasp_world[2] += GRIPPER_FINGER_REACH
+    base_world, base_quat = prim_world_pose(scene.base_path)
+    grasp_goal = ApproachGoal(
+        position=world_to_base(grasp_world.reshape(1, 3), base_world, base_quat)[0],
+        quaternion=hover_goal.quaternion.copy(),
+        center_world=center_world.copy(),
+        top_z=hover_goal.top_z,
+    )
+
+    say(f"lowering fingers around {spec['name']}")
+    servo.set_obstacle_enabled(spec["name"], False)
+    try:
+        reached, pending = _execute_pose(scene, servo, grasp_goal, perception, commands, max_steps, log, view)
+        if pending is not None:
+            return pending
+        if not reached:
+            say(f"could not plan the grasp approach for {spec['name']}; leaving the gripper open")
+            return None
+
+        say(f"closing gripper on {spec['name']}")
+        scene.set_gripper_closed(True)
+        for _ in range(GRIPPER_SETTLE_STEPS):
+            incoming = _poll(commands)
+            if incoming:
+                return incoming
+            scene.step()
+            rgb, _, _ = scene.read_sensors()
+            _update_tracker(perception, rgb, view)
+
+        top_z = float(center_world[2] + object_dims(spec)[2] / 2.0)
+        lift_world = center_world.copy()
+        lift_world[2] = top_z + LIFT_HEIGHT
+        base_world, base_quat = prim_world_pose(scene.base_path)
+        lift_goal = ApproachGoal(
+            position=world_to_base(lift_world.reshape(1, 3), base_world, base_quat)[0],
+            quaternion=hover_goal.quaternion.copy(),
+            center_world=center_world.copy(),
+            top_z=top_z,
+        )
+        say(f"lifting {spec['name']} to {LIFT_HEIGHT:.2f} m above the block")
+        reached, pending = _execute_pose(scene, servo, lift_goal, perception, commands, max_steps, log, view)
+        if pending is not None:
+            return pending
+        if not reached:
+            say(f"could not plan the lift for {spec['name']}")
+            return None
+
+        cube_world, _ = prim_world_pose(scene.object_paths[spec["name"]])
+        lift_height = float(cube_world[2] - center_world[2])
+        if lift_height < 0.015:
+            say(f"gripper lifted, but {spec['name']} did not follow ({lift_height:.3f} m)")
+        else:
+            say(f"grasped and lifted {spec['name']} by {lift_height:.3f} m")
+        return None
+    finally:
+        servo.set_obstacle_enabled(spec["name"], True)
+
+
+def _execute_pose(scene, servo, goal, perception, commands, max_steps: int, log, view) -> tuple[bool, str | None]:
+    servo.clear()
+    servo.update_goal(goal, scene.joint_positions())
+    if servo.trajectory is None:
+        return False, None
+
+    for step in range(max_steps):
+        incoming = _poll(commands)
+        if incoming:
+            return False, incoming
+        scene.step()
+        servo.update_goal(goal, scene.joint_positions())
+        command = servo.command()
+        if command:
+            scene.set_joint_targets(command)
+        rgb, _, _ = scene.read_sensors()
+        _update_tracker(perception, rgb, view)
+        if float(np.linalg.norm(servo.hand_position(scene.joint_positions()) - goal.position)) <= APPROACH_TOLERANCE:
+            return True, None
+        if servo.trajectory is None:
+            log(f"pose motion lost its trajectory at step {step}")
+            return False, None
+        if step % 60 == 0:
+            distance = float(np.linalg.norm(servo.hand_position(scene.joint_positions()) - goal.position))
+            log(f"pose step {step}: hand is {distance:.3f} m from target")
+    return False, None
 
 
 def _prompt_to_sam(perception, rgb: np.ndarray, prompt: str, say) -> tuple[tuple[float, float] | None, tuple[float, float, float, float] | None]:
@@ -253,7 +369,7 @@ def _numbers(prompt: str) -> list[float] | None:
         return None
 
 
-def _home(scene, servo, commands, max_steps: int, say, log, view) -> str | None:
+def _home(scene, perception, servo, commands, max_steps: int, say, log, view) -> str | None:
     from pseudo_vla.scene import HOME_ARM
 
     say("homing")
@@ -264,9 +380,8 @@ def _home(scene, servo, commands, max_steps: int, say, log, view) -> str | None:
         if incoming:
             return incoming
         scene.step()
-        if view is not None:
-            rgb, _, _ = scene.read_sensors()
-            view.update(rgb)
+        rgb, _, _ = scene.read_sensors()
+        _update_tracker(perception, rgb, view)
         command = servo.command()
         if command:
             scene.set_joint_targets(command)
@@ -284,6 +399,26 @@ def _home(scene, servo, commands, max_steps: int, say, log, view) -> str | None:
     say("home motion finished; holding the home joint targets")
     servo.clear()
     return None
+
+
+def _update_tracker(perception, rgb: np.ndarray, view) -> None:
+    tracked = perception.push_frame(rgb)
+    if view is None:
+        return
+    if tracked is None:
+        view.update(rgb, perception.mask, perception.query_xy)
+    else:
+        points, visible = tracked
+        view.update(rgb, None, points, visible)
+
+
+def _open_gripper_for_next_command(scene, perception, say, view) -> None:
+    say("opening gripper for the next command")
+    scene.set_gripper_closed(False)
+    for _ in range(GRIPPER_SETTLE_STEPS):
+        scene.step()
+        rgb, _, _ = scene.read_sensors()
+        _update_tracker(perception, rgb, view)
 
 
 def _gripper_place(scene, servo, goal) -> tuple[float, float]:

@@ -45,6 +45,7 @@ class ArmServo:
         self._base_quat = np.asarray(base_quat, dtype=np.float64)
         self._boxes = _obstacle_boxes(self._base_position, self._base_quat)
         self.planner.update_world(Scene(cuboid=[box.cuboid for box in self._boxes]))
+        self._enabled_obstacles = {box.name for box in self._boxes}
         for box in self._boxes:
             if box.name != "table":
                 self.planner.scene_collision_checker.enable_obstacle(box.name, True)
@@ -88,6 +89,17 @@ class ArmServo:
         state = self._joint_state(joint_map)
         pose = self.planner.compute_kinematics(state).tool_poses.get_link_pose("panda_hand")
         return pose.position[0].detach().cpu().numpy()
+
+    def set_obstacle_enabled(self, name: str, enabled: bool) -> None:
+        if name not in {box.name for box in self._boxes}:
+            raise ValueError(f"Unknown collision obstacle {name!r}")
+        if (name in self._enabled_obstacles) == enabled:
+            return
+        self.planner.scene_collision_checker.enable_obstacle(name, enabled)
+        if enabled:
+            self._enabled_obstacles.add(name)
+        else:
+            self._enabled_obstacles.remove(name)
 
     def update_goal(self, goal: ApproachGoal, joint_map: dict[str, float]) -> None:
         moved = self.goal is None or float(np.linalg.norm(goal.position - self.goal.position)) > REPLAN_DISTANCE
