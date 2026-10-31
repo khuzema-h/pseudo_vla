@@ -30,7 +30,9 @@ def interpret_task_prompt(user_prompt: str, scene_state: dict[str, object] | Non
     user_content = (
         f"Instruction: {user_prompt.strip()}\n"
         f"Current scene state (ground truth): {state_text}\n"
-        "Use only these current-scene objects and relationships; do not guess hidden or occluded state."
+        "Use only these current-scene objects and relationships; do not guess hidden or occluded state. "
+        "Placing one object on another uses destination kind on and that object's id. "
+        "Use kind at only when the target is a location id from the scene state."
     )
     response = _post_json(
         "/api/chat",

@@ -169,12 +169,13 @@ remains authoritative for supported objects and destinations.
 
 Planned pick-and-place actions approach a selected block, use wrist RGB-D to refine alignment, close the gripper, lift it, move to the validated destination, and release it. Direct numeric pixel/box prompts retain the legacy behavior of approaching and grasping without a destination. The source block is omitted from cuRobo collision checks only during intentional contact; the table and other blocks remain obstacles.
 
-Each pick-and-place action seeds SAM at the projected image location of the block to move, and also the reference block when the destination is on, left of, or right of that block. CoTracker points unprojected through the environment camera's depth drive the approach. At the hover pose, wrist RGB-D refines the hover and grasp positions; the gripper stays open if wrist RGB-D cannot localize the cube. Stacking on another block drops the moving block's points after the grasp and uses the tracked support surface for placement. Table, left, and right placements use the validated geometric destination: a block's clear home slot, or a pose beside the reference block. The robot faces +Y, so left is world -X and right is world +X. Projected positions only seed SAM; the environment and wrist depth images provide 3D approach and grasp measurements. The moved block's collision geometry is refreshed from its simulated position after each phase.
+Each pick-and-place action finds the blocks in the environment camera. A color named by the object id is boxed from the image; other phrases use OWL-ViT. SAM is seeded on those boxes. Scene state always lists the scene's object ids, and includes a position only after a depth measurement. Object positions used for collision boxes, clearance, and placement come from unprojecting that camera's depth. A place is reported only when a new depth measurement shows the object at the destination. CoTracker points unprojected through the same depth drive the approach. A seen OOAL affordance named in the instruction, such as hold in "hold mug and place it on the plate", supplies the heatmap. SAM still segments the grasped object and the placement target. CoTracker points for the grasped object are sampled on the hot part of that heatmap inside the SAM mask. Those 3D points are projected into the wrist camera, and wrist depth at the projected pixels aligns the gripper before it descends onto the same points. The placement target keeps points across its full mask. Wrist segmentation refines the hover only when the instruction names no seen affordance. The gripper stays open if that wrist view cannot localize the object. Stacking on another block drops the moving block's points after the grasp and uses the tracked support surface for placement. Table, left, and right placements use the validated geometric destination: a block's clear home slot, or a pose beside the reference block. The robot faces +Y, so left is world -X and right is world +X. Projected positions only seed SAM; the environment and wrist depth images provide 3D approach and grasp measurements. The moved block's collision geometry is refreshed from a new environment-camera depth measurement after each phase.
 
 Useful flags:
 
 ```bash
 python scripts/track_and_servo.py --instruction "stack blue on red" # general task prompt
+python scripts/track_and_servo.py --scene kitchen             # counter with plates, mugs, and utensils
 python scripts/track_and_servo.py --target "red block"        # deprecated --instruction alias
 python scripts/track_and_servo.py --stack-prompt "stack green, then red, then blue" # legacy full-stack mode
 python scripts/track_and_servo.py --headless                  # no Isaac windows
@@ -186,9 +187,11 @@ Run a general task in the project's Conda environment:
 ```bash
 OMNI_KIT_ACCEPT_EULA=YES conda run -n ps_vla python scripts/track_and_servo.py \
   --instruction "put blue to the left of red"
+
+The default scene is the simple room with red, green, and blue blocks. `--scene kitchen` builds a separate counter kitchen. Its manipulable objects are a dinner plate, a small plate, two mugs from the Isaac Sim asset pack, and a fork, spoon, and knife. The work surface location is `counter`. `--stack-prompt` stays on the block scene.
 ```
 
-Logs for each step go to `outputs/run.log`. The first segmented frame is saved to `outputs/frame0_overlay.png`.
+Each simulator run saves its terminal output to a new file under `outputs/logs/`, and `outputs/logs/latest.log` points at the newest one. Step details that are not printed are appended to that same file. The first segmented frame is saved to `outputs/frame0_overlay.png`.
 
 ## Implemented behavior and validation
 
@@ -205,5 +208,5 @@ Logs for each step go to `outputs/run.log`. The first segmented frame is saved t
 - `--stack-prompt` requires red, green, and blue and interprets the requested bottom-to-top order before simulator startup. It runs all requested placements without inter-placement pauses.
 - d3 uses the typed `/v1/systemone` choice API to authorize find, plan, approach, grasp, and place boundaries. Invalid, unavailable, or stop decisions halt the workflow; d3 does not directly command robot joints.
 - Pickup beside a taller nearby block first routes to a higher transit waypoint, then descends to the 10 cm hover pose so the approach clears that block. A block that is already the local high point approaches its hover pose directly.
-- Automated validation: `conda run -n ps_vla python -m unittest discover -s tests -v` passes 56 tests. The suite covers scene-neutral task-plan validation, d3 stops, relative placement, stack compatibility, and perception helpers.
+- Automated validation: `conda run -n ps_vla python -m unittest discover -s tests -v` passes 81 tests. The suite covers scene-neutral task-plan validation, d3 stops, relative placement, stack compatibility, and perception helpers.
 - Not yet verified: end-to-end grasp, contact, table unstacking, relative placement, and task completion in a live Isaac Sim session. Passing unit tests do not establish physical execution success.

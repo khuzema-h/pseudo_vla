@@ -67,6 +67,16 @@ class TaskPlanTests(unittest.TestCase):
         )
         self.assertEqual(plan.actions, (PickPlaceAction("mug", Destination("inside", "bin")),))
 
+    def test_at_an_object_is_placement_on_that_object(self):
+        plan = self._validate(
+            "pick_place",
+            "",
+            [{"object": "mug", "destination": {"kind": "at", "target": "plate"}}],
+            available_objects=("mug", "plate"),
+            available_locations=("counter",),
+        )
+        self.assertEqual(plan.actions, (PickPlaceAction("mug", Destination("on", "plate")),))
+
     def test_rejects_container_absent_from_the_catalog(self):
         with self.assertRaisesRegex(TaskPlanError, "not present in the current scene"):
             self._validate(

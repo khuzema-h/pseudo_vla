@@ -15,6 +15,7 @@ from pseudo_vla.geometry import (
     TOP_DOWN_WXYZ,
     base_to_world,
     mask_depth_points,
+    pose_from_depth_points,
     prim_world_pose,
     project_world_point,
     quat_inverse,
@@ -73,26 +74,51 @@ class Perception:
         """Turn a free-text prompt into the best box on this image."""
         return self.grounder.ground(rgb, text)
 
+    def ground_all(
+        self,
+        rgb: np.ndarray,
+        phrases: list[str],
+    ) -> dict[str, tuple[tuple[float, float, float, float], float]]:
+        """Box every phrase. A named color is taken from the image before OWL-ViT."""
+        return self.grounder.ground_all(rgb, phrases)
+
     def segment(self, rgb: np.ndarray, point: tuple[float, float] | None, box: tuple[float, float, float, float] | None) -> np.ndarray:
         groups = self.segment_groups(rgb, {"target": (point, box)})
         return groups["target"]
 
     def segment_mask(self, rgb: np.ndarray, point: tuple[float, float]) -> np.ndarray:
         """Segment an object from a positive image point without changing tracker queries."""
+        return self.segment_region(rgb, point=point)
+
+    def segment_region(
+        self,
+        rgb: np.ndarray,
+        point: tuple[float, float] | None = None,
+        box: tuple[float, float, float, float] | None = None,
+    ) -> np.ndarray:
+        """Segment one image region without changing CoTracker queries."""
+        if (point is None) == (box is None):
+            raise ValueError("Segmentation requires either a point or a box")
         image = np.ascontiguousarray(rgb[..., :3])
         if image.dtype != np.uint8:
             image = np.clip(image, 0, 255).astype(np.uint8)
         self._ensure_sam()
         try:
             self.sam.set_image(image)
-            masks, scores, _ = self.sam.predict(
-                point_coords=np.array([[point[0], point[1]]], dtype=np.float32),
-                point_labels=np.array([1], dtype=np.int32),
-                multimask_output=True,
-            )
+            if point is not None:
+                masks, scores, _ = self.sam.predict(
+                    point_coords=np.array([[point[0], point[1]]], dtype=np.float32),
+                    point_labels=np.array([1], dtype=np.int32),
+                    multimask_output=True,
+                )
+            else:
+                masks, scores, _ = self.sam.predict(
+                    box=np.array(box, dtype=np.float32),
+                    multimask_output=False,
+                )
             mask = masks[int(np.argmax(scores))] > 0
             if not np.any(mask):
-                raise RuntimeError(f"SAM 2 returned an empty mask for point {point}")
+                raise RuntimeError("SAM 2 returned an empty mask")
             return mask
         finally:
             self.sam.reset_predictor()
@@ -159,6 +185,22 @@ class Perception:
         group_points = {
             name: sample_mask_points(self.group_masks[name], count=count_per_group)
             for name in names
+        }
+        self._seed_tracker(image, group_points)
+
+    def replace_group_points(self, rgb: np.ndarray, name: str, points_xy: np.ndarray) -> None:
+        """Reseed CoTracker, keeping other groups and replacing one group's query points."""
+        if name not in self.query_groups or self.query_xy is None:
+            raise KeyError(f"No CoTracker query group named {name!r}")
+        points = np.asarray(points_xy, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 2 or len(points) == 0:
+            raise ValueError(f"CoTracker group {name!r} needs at least one image point")
+        image = np.ascontiguousarray(rgb)
+        if image.dtype != np.uint8:
+            image = np.clip(image, 0, 255).astype(np.uint8)
+        group_points = {
+            group_name: points if group_name == name else self.query_xy[span].copy()
+            for group_name, span in self.query_groups.items()
         }
         self._seed_tracker(image, group_points)
 

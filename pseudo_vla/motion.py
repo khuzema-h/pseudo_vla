@@ -55,6 +55,41 @@ def execute_pose(
     return False, None
 
 
+def close_gripper_in_place(scene, perception, commands, view, max_steps: int = 240) -> str | None:
+    """Close the fingers while the arm holds its current joints.
+
+    Returns a queued command if one arrives. The arm stays put until the
+    fingers stop moving, including when an object blocks them short of fully shut.
+    """
+    from pseudo_vla.scene import ARM_JOINT_NAMES, CLOSED_FINGERS
+
+    positions = scene.joint_positions()
+    hold = {name: positions[name] for name in ARM_JOINT_NAMES if name in positions}
+    scene.set_joint_targets({**hold, **CLOSED_FINGERS})
+    scene.gripper_closed = True
+    previous = None
+    still = 0
+    for _ in range(max_steps):
+        incoming = poll_command(commands)
+        if incoming:
+            return incoming
+        scene.step()
+        rgb, depth, _ = scene.read_sensors()
+        update_tracker(scene, perception, rgb, depth, view)
+        current = scene.joint_positions()
+        scene.set_joint_targets({**hold, **CLOSED_FINGERS})
+        if previous is not None:
+            moved = max(abs(current.get(name, 0.0) - previous[name]) for name in CLOSED_FINGERS)
+            if moved < 0.001:
+                still += 1
+                if still >= 12:
+                    return None
+            else:
+                still = 0
+        previous = {name: current[name] for name in CLOSED_FINGERS}
+    return None
+
+
 def settle_tracker(
     scene,
     perception,

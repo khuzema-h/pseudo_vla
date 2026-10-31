@@ -18,7 +18,9 @@ TABLE_TOP_Z = float(TABLE_MAX[2])
 # The arm stands on the near edge of the table and faces +Y, toward the props.
 ARM_POSITION = (0.0, -0.60, TABLE_TOP_Z + 0.002)
 # Keep the historical name for callers while sharing the canonical definitions.
+SCENE_NAME = "blocks"
 SCENE_OBJECTS = BLOCK_SPECS
+SURFACE_LOCATION = "table"
 ENV_CAMERA_PATH = "/World/EnvCamera"
 # In front of the arm (it faces +Y), close enough to clearly resolve the blocks.
 ENV_CAMERA_EYE = np.array([0.0, 0.35, 0.65], dtype=np.float64)
@@ -47,6 +49,81 @@ CLOSED_FINGERS = {
     "panda_finger_joint2": 0.0,
 }
 ARM_JOINT_NAMES = list(HOME_ARM)
+# A few millimeters of position error at the default drive is too weak to lift
+# the mug. 120 N crushed the handle and pushed it out. 2.5 kN/m asks for about
+# 25 N at a 1 cm gap, and the cap stops the fingers from slamming harder.
+FINGER_GRIP_STIFFNESS = 2500.0
+FINGER_GRIP_DAMPING = 40.0
+FINGER_GRIP_EFFORT = 25.0
+
+_BLOCKS_TABLE_MIN = TABLE_MIN.copy()
+_BLOCKS_TABLE_MAX = TABLE_MAX.copy()
+_BLOCKS_ARM_POSITION = ARM_POSITION
+_BLOCKS_CAMERA_EYE = ENV_CAMERA_EYE.copy()
+_BLOCKS_CAMERA_TARGET = ENV_CAMERA_TARGET.copy()
+
+
+def object_id(spec: dict) -> str:
+    return str(spec.get("id") or spec["name"].removesuffix("_block"))
+
+
+def object_phrase(spec: dict) -> str:
+    phrase = spec.get("phrase")
+    if isinstance(phrase, str) and phrase.strip():
+        return phrase
+    return f"{object_id(spec).replace('_', ' ')} block"
+
+
+def spec_by_id(object_name: str) -> dict | None:
+    for spec in SCENE_OBJECTS:
+        if object_id(spec) == object_name:
+            return spec
+    return None
+
+
+def surface_location() -> str:
+    return SURFACE_LOCATION
+
+
+def select_scene(name: str) -> None:
+    """Point the live scene constants at the block table or the kitchen counter."""
+    global SCENE_NAME, SCENE_OBJECTS, SURFACE_LOCATION
+    global TABLE_MIN, TABLE_MAX, TABLE_DIMS, TABLE_CENTER, TABLE_TOP_Z, ARM_POSITION
+    global ENV_CAMERA_EYE, ENV_CAMERA_TARGET
+
+    if name == "blocks":
+        SCENE_NAME = "blocks"
+        SCENE_OBJECTS = BLOCK_SPECS
+        SURFACE_LOCATION = "table"
+        TABLE_MIN = _BLOCKS_TABLE_MIN.copy()
+        TABLE_MAX = _BLOCKS_TABLE_MAX.copy()
+        ARM_POSITION = _BLOCKS_ARM_POSITION
+        ENV_CAMERA_EYE = _BLOCKS_CAMERA_EYE.copy()
+        ENV_CAMERA_TARGET = _BLOCKS_CAMERA_TARGET.copy()
+    elif name == "kitchen":
+        from pseudo_vla.kitchen import (
+            ARM_POSITION as KITCHEN_ARM,
+            COUNTER_MAX,
+            COUNTER_MIN,
+            ENV_CAMERA_EYE as KITCHEN_EYE,
+            ENV_CAMERA_TARGET as KITCHEN_TARGET,
+            KITCHEN_OBJECTS,
+            SURFACE_LOCATION as KITCHEN_SURFACE,
+        )
+
+        SCENE_NAME = "kitchen"
+        SCENE_OBJECTS = KITCHEN_OBJECTS
+        SURFACE_LOCATION = KITCHEN_SURFACE
+        TABLE_MIN = COUNTER_MIN.copy()
+        TABLE_MAX = COUNTER_MAX.copy()
+        ARM_POSITION = KITCHEN_ARM
+        ENV_CAMERA_EYE = KITCHEN_EYE.copy()
+        ENV_CAMERA_TARGET = KITCHEN_TARGET.copy()
+    else:
+        raise ValueError(f"Unknown scene {name!r}")
+    TABLE_DIMS = TABLE_MAX - TABLE_MIN
+    TABLE_CENTER = (TABLE_MIN + TABLE_MAX) / 2.0
+    TABLE_TOP_Z = float(TABLE_MAX[2])
 
 
 def launch(headless: bool):
@@ -79,10 +156,6 @@ def _ros_optical_to_usd(quat_wxyz: tuple[float, float, float, float]) -> tuple[f
 
 def _log(message: str) -> None:
     print(message, flush=True)
-    path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "outputs", "run.log")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a", encoding="utf-8") as handle:
-        handle.write(message + "\n")
 
 
 def _find_prim_path(stage, name: str) -> str:
@@ -386,8 +459,84 @@ def _place_block(spec: dict) -> str:
     return path
 
 
-def build_scene(app) -> FrankaScene:
-    """Load the simple room, Franka, three colored blocks, and both cameras."""
+def _set_translate(prim, translation: tuple[float, float, float]) -> None:
+    """Set the prim translate, reusing an op that a referenced asset already authored."""
+    from pxr import Gf, UsdGeom
+
+    xform = UsdGeom.Xformable(prim)
+    value = tuple(float(item) for item in translation)
+    for op in xform.GetOrderedXformOps():
+        if op.GetOpType() != UsdGeom.XformOp.TypeTranslate:
+            continue
+        if op.GetPrecision() == UsdGeom.XformOp.PrecisionFloat:
+            op.Set(Gf.Vec3f(*value))
+        else:
+            op.Set(Gf.Vec3d(*value))
+        return
+    xform.AddTranslateOp().Set(Gf.Vec3d(*value))
+
+
+def _place_asset(spec: dict, assets_root: str) -> str:
+    """Reference a mesh and seat its bottom on the current work surface."""
+    import omni.usd
+    from pxr import Usd, UsdGeom, UsdPhysics
+
+    path = f"/World/{spec['name']}"
+    import isaacsim.core.experimental.utils.stage as stage_utils
+
+    stage_utils.add_reference_to_stage(assets_root + spec["asset"], path)
+    stage = omni.usd.get_context().get_stage()
+    prim = stage.GetPrimAtPath(path)
+    xy = spec["xy"]
+    _set_translate(prim, (float(xy[0]), float(xy[1]), TABLE_TOP_Z))
+    if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+        UsdPhysics.RigidBodyAPI.Apply(prim)
+    mass = UsdPhysics.MassAPI.Apply(prim)
+    mass.CreateMassAttr(float(spec.get("mass", 0.3)))
+    for descendant in Usd.PrimRange(prim):
+        if descendant == prim or not (descendant.IsA(UsdGeom.Mesh) or descendant.IsA(UsdGeom.Gprim)):
+            continue
+        if not descendant.HasAPI(UsdPhysics.CollisionAPI):
+            UsdPhysics.CollisionAPI.Apply(descendant)
+        if descendant.IsA(UsdGeom.Mesh) and not descendant.HasAPI(UsdPhysics.MeshCollisionAPI):
+            mesh = UsdPhysics.MeshCollisionAPI.Apply(descendant)
+            mesh.CreateApproximationAttr("convexHull")
+    _seat_on_surface(path, spec)
+    _record_prop_bounds(spec)
+    return path
+
+
+def _seat_on_surface(path: str, spec: dict) -> None:
+    """Lift a referenced mesh so its lowest point rests on the work surface."""
+    import omni.usd
+    from pxr import Usd, UsdGeom
+
+    stage = omni.usd.get_context().get_stage()
+    prim = stage.GetPrimAtPath(path)
+    cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render"])
+    box = cache.ComputeWorldBound(prim).ComputeAlignedBox()
+    minimum = box.GetMin()
+    lift = TABLE_TOP_Z + 0.002 - float(minimum[2])
+    if abs(lift) < 1e-4:
+        return
+    xy = spec["xy"]
+    _set_translate(prim, (float(xy[0]), float(xy[1]), TABLE_TOP_Z + lift))
+
+
+def strengthen_finger_grip(arm) -> None:
+    """Raise the finger-drive stiffness and force limit so a grasp does not slip."""
+    names = list(arm.dof_names)
+    indices = [names.index(name) for name in CLOSED_FINGERS]
+    arm.set_dof_gains(
+        stiffnesses=[FINGER_GRIP_STIFFNESS, FINGER_GRIP_STIFFNESS],
+        dampings=[FINGER_GRIP_DAMPING, FINGER_GRIP_DAMPING],
+        dof_indices=indices,
+    )
+    arm.set_dof_max_efforts([FINGER_GRIP_EFFORT, FINGER_GRIP_EFFORT], dof_indices=indices)
+
+
+def build_scene(app, scene_name: str = "blocks") -> FrankaScene:
+    """Load the selected room, Franka, manipulable objects, and both cameras."""
     import omni.replicator.core as rep
     import isaacsim.core.experimental.utils.app as app_utils
     import isaacsim.core.experimental.utils.stage as stage_utils
@@ -395,7 +544,8 @@ def build_scene(app) -> FrankaScene:
     from isaacsim.core.experimental.prims import Articulation
     from isaacsim.storage.native import get_assets_root_path
 
-    _log("new stage")
+    select_scene(scene_name)
+    _log(f"new {SCENE_NAME} stage")
     app_utils.enable_extension("omni.replicator.core")
     stage_utils.create_new_stage(template="empty")
     _ensure_physics_scene()
@@ -404,17 +554,40 @@ def build_scene(app) -> FrankaScene:
     assets = get_assets_root_path()
     if not assets:
         raise RuntimeError("Isaac Sim assets root was not found")
-    room = assets + "/Isaac/Environments/Simple_Room/simple_room.usd"
-    stage_utils.add_reference_to_stage(room, "/World/SimpleRoom")
-    _log(f"referenced {room}")
-    _collide_room_table()
+    if SCENE_NAME == "kitchen":
+        import omni.usd
+        from pseudo_vla.kitchen import add_kitchen_room
+
+        add_kitchen_room(omni.usd.get_context().get_stage())
+        _log("kitchen room ready")
+    else:
+        room = assets + "/Isaac/Environments/Simple_Room/simple_room.usd"
+        stage_utils.add_reference_to_stage(room, "/World/SimpleRoom")
+        _log(f"referenced {room}")
+        _collide_room_table()
 
     usd = assets + "/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"
     stage_utils.add_reference_to_stage(usd, "/World/Arm")
     _place_arm("/World/Arm")
     _log(f"referenced {usd}")
 
-    object_paths = {spec["name"]: _place_block(spec) for spec in SCENE_OBJECTS}
+    object_paths = {}
+    for spec in SCENE_OBJECTS:
+        if spec.get("kind") == "asset":
+            object_paths[spec["name"]] = _place_asset(spec, assets)
+        elif spec.get("kind") in {"plate", "fork", "spoon", "knife"}:
+            from pseudo_vla.kitchen import place_kitchen_prop
+
+            import omni.usd
+
+            object_paths[spec["name"]] = place_kitchen_prop(
+                omni.usd.get_context().get_stage(),
+                spec,
+                TABLE_TOP_Z,
+            )
+            _record_prop_bounds(spec)
+        else:
+            object_paths[spec["name"]] = _place_block(spec)
 
     import omni.usd
 
@@ -472,6 +645,8 @@ def build_scene(app) -> FrankaScene:
         wrist_depth_annot=wrist_depth_annot,
         wrist_camera_annot=wrist_camera_annot,
     )
+    strengthen_finger_grip(scene_arm)
+    _log(f"finger grip drive {FINGER_GRIP_EFFORT:.0f} N")
     scene.set_home()
     _log("home pose set")
     for _ in range(20):

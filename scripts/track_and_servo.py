@@ -1,4 +1,4 @@
-"""CLI entry point for the Isaac Sim block-stacking controller."""
+"""CLI entry point for the Isaac Sim pick-and-place controller."""
 
 from __future__ import annotations
 

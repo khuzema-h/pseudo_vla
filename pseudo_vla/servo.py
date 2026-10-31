@@ -10,8 +10,9 @@ from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
 from curobo.scene import Cuboid, Scene
 from curobo.types import GoalToolPose, JointState, Pose
 
+from pseudo_vla import scene as scene_module
 from pseudo_vla.perception import ApproachGoal, quat_inverse, world_to_base
-from pseudo_vla.scene import ARM_JOINT_NAMES, SCENE_OBJECTS, TABLE_CENTER, TABLE_DIMS, object_center, object_dims
+from pseudo_vla.scene import ARM_JOINT_NAMES
 
 REPLAN_DISTANCE = 0.02
 GOAL_TOLERANCE = 0.005
@@ -36,7 +37,7 @@ class ArmServo:
         config = MotionPlannerCfg.create(
             robot="franka.yml",
             self_collision_check=True,
-            collision_cache={"cuboid": 8},
+            collision_cache={"cuboid": 12},
             optimizer_collision_activation_distance=0.03,
             use_cuda_graph=True,
         )
@@ -101,14 +102,19 @@ class ArmServo:
         else:
             self._enabled_obstacles.remove(name)
 
-    def update_block_positions(self, centers: dict[str, np.ndarray]) -> None:
+    def update_block_positions(
+        self,
+        centers: dict[str, np.ndarray],
+        dims: dict[str, np.ndarray] | None = None,
+    ) -> None:
         enabled = self._enabled_obstacles.copy()
-        self._boxes = _obstacle_boxes(self._base_position, self._base_quat, centers)
+        previous = {box.name for box in self._boxes}
+        self._boxes = _obstacle_boxes(self._base_position, self._base_quat, centers, dims)
         self.planner.update_world(Scene(cuboid=[box.cuboid for box in self._boxes]))
         self._enabled_obstacles = set()
         for box in self._boxes:
             if box.name != "table":
-                is_enabled = box.name in enabled
+                is_enabled = box.name in enabled or box.name not in previous
                 self.planner.scene_collision_checker.enable_obstacle(box.name, is_enabled)
                 if is_enabled:
                     self._enabled_obstacles.add(box.name)
@@ -181,12 +187,19 @@ def _obstacle_boxes(
     base_position: np.ndarray,
     base_quat: np.ndarray,
     centers: dict[str, np.ndarray] | None = None,
+    dims: dict[str, np.ndarray] | None = None,
 ) -> list[_ObstacleBox]:
-    """World-aligned boxes expressed in the robot base frame."""
-    specs = [("table", TABLE_CENTER, TABLE_DIMS, 0.0)]
-    for spec in SCENE_OBJECTS:
-        center = (centers or {}).get(spec["name"], object_center(spec))
-        specs.append((spec["name"], center, object_dims(spec), OBSTACLE_PADDING))
+    """World-aligned boxes expressed in the robot base frame.
+
+    Object cuboids are included only when a measured center and extent are supplied.
+    """
+    specs = [("table", scene_module.TABLE_CENTER, scene_module.TABLE_DIMS, 0.0)]
+    measured_dims = dims or {}
+    for spec in scene_module.SCENE_OBJECTS:
+        name = spec["name"]
+        if centers is None or name not in centers or name not in measured_dims:
+            continue
+        specs.append((name, centers[name], measured_dims[name], OBSTACLE_PADDING))
     boxes = []
     for name, center_world, dims_world, padding in specs:
         center = world_to_base(np.asarray(center_world, dtype=np.float64).reshape(1, 3), base_position, base_quat)[0]

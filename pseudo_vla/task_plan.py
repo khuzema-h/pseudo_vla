@@ -90,6 +90,9 @@ def validate_task_plan(
         if kind not in DESTINATION_KINDS:
             raise TaskPlanError(f"unsupported destination kind {kind!r}")
         target = _identifier(raw_destination["target"], "destination target")
+        if kind == "at" and target in objects and target not in locations:
+            # A named object is a support, not a location. "at the plate" means on it.
+            kind = "on"
         if kind == "at":
             if target not in locations:
                 raise TaskPlanError(f"location {target!r} is not present in the current scene")

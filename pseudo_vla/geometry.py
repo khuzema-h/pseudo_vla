@@ -68,6 +68,25 @@ def base_to_world(
     return (rotation @ points.T).T + base_position
 
 
+def pose_from_depth_points(points: np.ndarray) -> tuple[np.ndarray, float, np.ndarray]:
+    """Return center, top height, and extent from environment-camera depth points."""
+    if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] < 4:
+        raise ValueError("Depth points must be an Nx3 array with at least 4 points")
+    finite = points[np.isfinite(points).all(axis=1)]
+    if finite.shape[0] < 4:
+        raise ValueError("Depth points contain fewer than 4 finite samples")
+    top_z = tracked_surface_top(finite)
+    low = np.percentile(finite, 5, axis=0)
+    high = np.percentile(finite, 95, axis=0)
+    dims = np.maximum(high - low, 0.02).astype(np.float64)
+    xy_size = float(np.median(dims[:2]))
+    if dims[2] < 0.5 * xy_size:
+        dims[2] = xy_size
+    center = np.median(finite, axis=0).astype(np.float64)
+    center[2] = top_z - float(dims[2]) / 2.0
+    return center, top_z, dims
+
+
 def tracked_surface_top(points: np.ndarray) -> float:
     """Estimate the top of a tracked surface while rejecting isolated depth outliers."""
     if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] == 0:
@@ -197,6 +216,21 @@ def unproject_tracks(
     if not points:
         return np.zeros((0, 3), dtype=np.float64)
     return np.stack(points, axis=0)
+
+
+def project_tracks_into_view(points_world: np.ndarray, project, width: int, height: int) -> np.ndarray:
+    """Project world points into a camera and keep the ones inside the image."""
+    pixels = []
+    for point in np.asarray(points_world, dtype=np.float64).reshape(-1, 3):
+        pixel = project(point)
+        if pixel is None:
+            continue
+        u, v = float(pixel[0]), float(pixel[1])
+        if 0.0 <= u < width and 0.0 <= v < height:
+            pixels.append((u, v))
+    if not pixels:
+        return np.zeros((0, 2), dtype=np.float32)
+    return np.asarray(pixels, dtype=np.float32)
 
 
 def project_world_point(

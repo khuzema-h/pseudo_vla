@@ -104,6 +104,36 @@ class StackingPerceptionTests(unittest.TestCase):
         self.assertFalse(np.any(instance.mask[4:28, 4:28]))
         self.assertFalse(np.any(instance.mask[36:60, 36:60]))
 
+    def test_replace_group_points_keeps_the_other_group(self):
+        instance = perception.Perception.__new__(perception.Perception)
+        instance.sam = _FakeSam()
+        instance.tracker = _FakeTracker()
+        instance.frames = []
+        instance.queries = None
+        instance.query_groups = {}
+        instance._window_start = 0
+        instance.mask = None
+        instance.query_xy = None
+        instance.group_masks = {}
+        instance._ensure_sam = lambda: None
+        image = np.zeros((64, 64, 3), dtype=np.uint8)
+        prompts = {
+            "support": (None, (4, 4, 28, 28)),
+            "moving": (None, (36, 36, 60, 60)),
+        }
+        grasp_points = np.array([[40, 40], [42, 40], [40, 44], [42, 44]], dtype=np.float32)
+
+        with patch.object(perception.torch.Tensor, "cuda", lambda tensor: tensor):
+            instance.segment_groups(image, prompts, count_per_group=4)
+            support_points = instance.query_xy[:4].copy()
+            instance.replace_group_points(image, "moving", grasp_points)
+
+        np.testing.assert_array_equal(instance.query_xy[:4], support_points)
+        np.testing.assert_array_equal(instance.query_xy[4:], grasp_points)
+        self.assertEqual(instance.query_groups["moving"], slice(4, 8))
+        self.assertTrue(np.all(instance.mask[4:28, 4:28]))
+        self.assertTrue(np.all(instance.mask[36:60, 36:60]))
+
     def test_placement_targets_center_on_tracked_top_surface(self):
         support_points = np.array(
             [
@@ -129,19 +159,26 @@ class StackingPerceptionTests(unittest.TestCase):
     def test_relative_placement_goals_place_left_of_target(self):
         from pseudo_vla.task_plan import Destination
 
-        scene = SimpleNamespace(object_paths={"red_block": "/red"})
+        scene = SimpleNamespace(
+            last_observed={
+                "red": SimpleNamespace(
+                    center_world=np.array([0.0, -0.3, 0.05]),
+                    dims=np.array([0.05, 0.05, 0.05]),
+                ),
+                "blue": SimpleNamespace(
+                    center_world=np.array([0.2, -0.3, 0.05]),
+                    dims=np.array([0.05, 0.05, 0.05]),
+                ),
+            }
+        )
         with (
             patch(
                 "pseudo_vla.perception.prim_world_pose",
-                side_effect=[
-                    (np.array([0.0, -0.3, 0.05]), np.array([1.0, 0.0, 0.0, 0.0])),
-                    (np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])),
-                ],
+                return_value=(np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])),
             ),
             patch("pseudo_vla.perception.world_to_base", side_effect=lambda points, *_: points),
             patch("pseudo_vla.perception.quat_inverse", return_value=np.array([1.0, 0.0, 0.0, 0.0])),
             patch("pseudo_vla.perception.quat_multiply", return_value=np.array([1.0, 0.0, 0.0, 0.0])),
-            patch("pseudo_vla.scene.object_dims", return_value=np.array([0.05, 0.05, 0.05])),
         ):
             preplace, place = track_and_servo._relative_placement_goals(
                 scene, "blue", Destination("left_of", "red"), "/base"
@@ -154,19 +191,26 @@ class StackingPerceptionTests(unittest.TestCase):
     def test_relative_placement_goals_place_right_of_target(self):
         from pseudo_vla.task_plan import Destination
 
-        scene = SimpleNamespace(object_paths={"red_block": "/red"})
+        scene = SimpleNamespace(
+            last_observed={
+                "red": SimpleNamespace(
+                    center_world=np.array([0.0, -0.3, 0.05]),
+                    dims=np.array([0.05, 0.05, 0.05]),
+                ),
+                "blue": SimpleNamespace(
+                    center_world=np.array([-0.2, -0.3, 0.05]),
+                    dims=np.array([0.05, 0.05, 0.05]),
+                ),
+            }
+        )
         with (
             patch(
                 "pseudo_vla.perception.prim_world_pose",
-                side_effect=[
-                    (np.array([0.0, -0.3, 0.05]), np.array([1.0, 0.0, 0.0, 0.0])),
-                    (np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])),
-                ],
+                return_value=(np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])),
             ),
             patch("pseudo_vla.perception.world_to_base", side_effect=lambda points, *_: points),
             patch("pseudo_vla.perception.quat_inverse", return_value=np.array([1.0, 0.0, 0.0, 0.0])),
             patch("pseudo_vla.perception.quat_multiply", return_value=np.array([1.0, 0.0, 0.0, 0.0])),
-            patch("pseudo_vla.scene.object_dims", return_value=np.array([0.05, 0.05, 0.05])),
         ):
             _preplace, place = track_and_servo._relative_placement_goals(
                 scene, "blue", Destination("right_of", "red"), "/base"
@@ -175,28 +219,21 @@ class StackingPerceptionTests(unittest.TestCase):
         np.testing.assert_allclose(place.center_world, [0.07, -0.3, 0.05])
 
     def test_table_slot_clearance_detects_other_block(self):
-        centers = {
-            "/World/red_block": (np.array([-0.22, -0.28, 0.035]), None),
-            "/World/green_block": (np.array([0.22, -0.28, 0.035]), None),
-            "/World/blue_block": (np.array([0.0, -0.28, 0.035]), None),
-        }
+        dims = np.array([0.05, 0.05, 0.05])
         scene = SimpleNamespace(
-            object_paths={
-                "red_block": "/World/red_block",
-                "green_block": "/World/green_block",
-                "blue_block": "/World/blue_block",
-            }
+            home_xy={"blue": np.array([0.22, -0.28])},
+            last_observed={
+                "red": SimpleNamespace(center_world=np.array([-0.22, -0.28, 0.035]), dims=dims),
+                "green": SimpleNamespace(center_world=np.array([0.22, -0.28, 0.035]), dims=dims),
+                "blue": SimpleNamespace(center_world=np.array([0.0, -0.28, 0.035]), dims=dims),
+            },
         )
-        with patch(
-            "pseudo_vla.perception.prim_world_pose",
-            side_effect=lambda path: centers[path],
-        ), patch("pseudo_vla.scene.object_dims", return_value=np.array([0.05, 0.05, 0.05])):
-            self.assertFalse(track_and_servo._table_slot_is_clear(scene, "blue"))
-            centers["/World/green_block"] = (
-                np.array([0.0, -0.28, 0.035]),
-                None,
-            )
-            self.assertTrue(track_and_servo._table_slot_is_clear(scene, "blue"))
+        self.assertFalse(track_and_servo._table_slot_is_clear(scene, "blue"))
+        scene.last_observed["green"] = SimpleNamespace(
+            center_world=np.array([0.0, -0.28, 0.035]),
+            dims=dims,
+        )
+        self.assertTrue(track_and_servo._table_slot_is_clear(scene, "blue"))
 
     def test_relative_placement_clearance_detects_block_in_destination(self):
         from pseudo_vla.task_plan import Destination
@@ -206,58 +243,53 @@ class StackingPerceptionTests(unittest.TestCase):
             "/green": (np.array([-0.07, -0.3, 0.05]), None),
             "/blue": (np.array([0.2, -0.3, 0.05]), None),
         }
+        dims = np.array([0.05, 0.05, 0.05])
         scene = SimpleNamespace(
             base_path="/base",
-            object_paths={
-                "red_block": "/red",
-                "green_block": "/green",
-                "blue_block": "/blue",
+            last_observed={
+                "red": SimpleNamespace(center_world=centers["/red"][0], dims=dims),
+                "green": SimpleNamespace(center_world=centers["/green"][0], dims=dims),
+                "blue": SimpleNamespace(center_world=centers["/blue"][0], dims=dims),
             },
         )
         destination = Destination("left_of", "red")
-        with (
-            patch.object(
-                track_and_servo,
-                "_relative_placement_goals",
-                return_value=(
-                    SimpleNamespace(center_world=np.zeros(3)),
-                    SimpleNamespace(center_world=np.array([-0.07, -0.3, 0.05])),
-                ),
+        with patch.object(
+            track_and_servo,
+            "_relative_placement_goals",
+            return_value=(
+                SimpleNamespace(center_world=np.zeros(3)),
+                SimpleNamespace(center_world=np.array([-0.07, -0.3, 0.05])),
             ),
-            patch(
-                "pseudo_vla.perception.prim_world_pose",
-                side_effect=lambda path: centers[path],
-            ),
-            patch("pseudo_vla.scene.object_dims", return_value=np.array([0.05, 0.05, 0.05])),
         ):
             self.assertFalse(
                 track_and_servo._relative_slot_is_clear(scene, "blue", destination)
             )
-            centers["/green"] = (np.array([0.0, -0.5, 0.05]), None)
+            scene.last_observed["green"] = SimpleNamespace(
+                center_world=np.array([0.0, -0.5, 0.05]),
+                dims=dims,
+            )
             self.assertTrue(
                 track_and_servo._relative_slot_is_clear(scene, "blue", destination)
             )
 
     def test_approach_transit_follows_nearby_taller_blocks(self):
-        centers = {
-            "red_block": np.array([-0.22, -0.28, 0.035]),
-            "green_block": np.array([0.0, -0.28, 0.035]),
-            "blue_block": np.array([-0.22, -0.28, 0.085]),
-        }
-        scene = SimpleNamespace(object_paths={name: name for name in centers})
+        dims = np.array([0.05, 0.05, 0.05])
 
-        def pose(path):
-            return centers[path], None
+        def item(center, top_z):
+            return SimpleNamespace(center_world=center, top_z=top_z, dims=dims)
 
-        with (
-            patch("pseudo_vla.perception.prim_world_pose", side_effect=pose),
-            patch("pseudo_vla.scene.object_dims", return_value=np.array([0.05, 0.05, 0.05])),
-        ):
-            self.assertTrue(track_and_servo._needs_approach_transit(scene, "green"))
-            self.assertTrue(track_and_servo._needs_approach_transit(scene, "red"))
-            self.assertFalse(track_and_servo._needs_approach_transit(scene, "blue"))
-            centers["blue_block"] = np.array([0.22, -0.28, 0.035])
-            self.assertFalse(track_and_servo._needs_approach_transit(scene, "green"))
+        scene = SimpleNamespace(
+            last_observed={
+                "red": item(np.array([-0.22, -0.28, 0.035]), 0.06),
+                "green": item(np.array([0.0, -0.28, 0.035]), 0.06),
+                "blue": item(np.array([-0.22, -0.28, 0.085]), 0.11),
+            }
+        )
+        self.assertTrue(track_and_servo._needs_approach_transit(scene, "green"))
+        self.assertTrue(track_and_servo._needs_approach_transit(scene, "red"))
+        self.assertFalse(track_and_servo._needs_approach_transit(scene, "blue"))
+        scene.last_observed["blue"] = item(np.array([0.22, -0.28, 0.035]), 0.06)
+        self.assertFalse(track_and_servo._needs_approach_transit(scene, "green"))
 
     def test_surface_top_rejects_high_depth_outlier(self):
         points = np.array(
@@ -329,25 +361,35 @@ class StackingPerceptionTests(unittest.TestCase):
         self.assertAlmostEqual(transit_goal.position[2], 0.06 + 0.10 + 0.15)
         np.testing.assert_array_equal(transit_goal.quaternion, hover_goal.quaternion)
 
-    def test_stack_cube_mask_prompt_uses_projected_scene_point(self):
-        scene = SimpleNamespace(
-            object_paths={"green_block": "/World/green"},
-            camera_path="/World/EnvCamera",
-        )
+    def test_object_mask_prompt_uses_environment_camera_grounding(self):
         image = np.zeros((480, 480, 3), dtype=np.uint8)
         messages = []
-        with (
-            patch.object(perception, "prim_world_pose", return_value=(np.array([0.0, -0.28, 0.035]), np.zeros(4))),
-            patch.object(perception, "project_world_point", return_value=np.array([240.0, 320.0])) as project,
-        ):
-            point, box = track_and_servo._projected_cube_prompt(
-                scene, image, {}, "green", messages.append
-            )
+        perception_instance = SimpleNamespace(
+            ground=lambda frame, text: ((10.0, 20.0, 40.0, 60.0), 0.2)
+        )
+        point, box = track_and_servo._visual_object_prompt(
+            perception_instance, image, "green", messages.append
+        )
 
-        self.assertEqual(point, (240.0, 320.0))
-        self.assertIsNone(box)
-        np.testing.assert_allclose(project.call_args.args[0], [0.0, -0.28, 0.035])
-        self.assertIn("seeding green SAM mask", messages[0])
+        self.assertIsNone(point)
+        self.assertEqual(box, (10.0, 20.0, 40.0, 60.0))
+        self.assertIn("seeding green SAM mask from environment camera", messages[0])
+
+    def test_depth_points_provide_object_pose(self):
+        points = np.array(
+            [
+                [0.00, 0.00, 0.05],
+                [0.05, 0.00, 0.05],
+                [0.00, 0.05, 0.05],
+                [0.05, 0.05, 0.05],
+            ],
+            dtype=np.float64,
+        )
+        center, top_z, dims = perception.pose_from_depth_points(points)
+        np.testing.assert_allclose(center[:2], [0.025, 0.025])
+        self.assertAlmostEqual(top_z, 0.05)
+        self.assertLess(center[2], top_z)
+        self.assertGreater(dims[0], 0.02)
 
     def test_text_prompt_reuses_matching_active_tracker_group_if_grounding_fails(self):
         image = np.zeros((32, 32, 3), dtype=np.uint8)
@@ -583,8 +625,8 @@ class StackingPerceptionTests(unittest.TestCase):
         view = SimpleNamespace(update=lambda *args, **kwargs: None)
         with patch.object(
             track_and_servo,
-            "_projected_cube_prompt",
-            return_value=((16.0, 16.0), None),
+            "_visual_object_prompt",
+            return_value=(None, (12.0, 12.0, 20.0, 20.0)),
         ) as prompt, patch.object(track_and_servo, "_update_camera_views"):
             track_and_servo._seed_placed_cube_tracking(scene, perception_instance, "green", say, view)
 
@@ -637,6 +679,115 @@ class StackingPerceptionTests(unittest.TestCase):
         np.testing.assert_array_equal(goal.quaternion, quaternion)
         self.assertEqual(unproject.call_args.args[3], scene.wrist_camera_path)
         self.assertIn("wrist RGB-D aligned green", messages[0])
+
+
+def _env_object(object_id: str, center: list[float]) -> track_and_servo.EnvObject:
+    return track_and_servo.EnvObject(
+        object_id=object_id,
+        spec_name=f"{object_id}_block",
+        center_world=np.array(center, dtype=np.float64),
+        top_z=center[2] + 0.025,
+        dims=np.array([0.05, 0.05, 0.05], dtype=np.float64),
+        box=(0.0, 0.0, 10.0, 10.0),
+    )
+
+
+class SceneMeasurementTests(unittest.TestCase):
+    def test_color_box_separates_the_three_cubes(self):
+        from pseudo_vla.grounding import ObjectGrounder, color_box
+
+        image = np.zeros((80, 80, 3), dtype=np.uint8)
+        image[10:30, 10:30] = (220, 20, 20)
+        image[10:30, 50:70] = (20, 200, 20)
+        image[50:70, 30:50] = (20, 40, 220)
+        red = color_box(image, "red block")
+        green = color_box(image, "green block")
+        blue = color_box(image, "blue block")
+        self.assertIsNotNone(red)
+        self.assertIsNotNone(green)
+        self.assertIsNotNone(blue)
+        self.assertLess(red[0], 20)
+        self.assertGreater(green[0], 40)
+        self.assertGreater(blue[1], 40)
+        self.assertIsNone(color_box(image, "mug"))
+
+        grounder = ObjectGrounder()
+        found = grounder.ground_all(image, ["red block", "green block", "blue block"])
+        self.assertEqual(set(found), {"red block", "green block", "blue block"})
+        self.assertIsNone(grounder._model)
+
+    def test_scene_state_keeps_objects_the_camera_missed(self):
+        scene = SimpleNamespace()
+        with patch.object(
+            track_and_servo,
+            "_observe_objects",
+            return_value={"red": _env_object("red", [-0.22, -0.28, 0.03])},
+        ):
+            state = track_and_servo._task_scene_state(scene, object())
+
+        self.assertEqual([item["id"] for item in state["objects"]], ["red", "green", "blue"])
+        self.assertIn("position_world_m", state["objects"][0])
+        self.assertNotIn("position_world_m", state["objects"][1])
+        self.assertNotIn("position_world_m", state["objects"][2])
+
+    def test_placement_check_rejects_green_left_beside_red(self):
+        from pseudo_vla.task_plan import Destination
+
+        measured = {
+            "green": _env_object("green", [0.0, -0.28, 0.035]),
+            "red": _env_object("red", [-0.22, -0.28, 0.030]),
+        }
+        reason = track_and_servo._placement_failure(
+            measured,
+            "green",
+            Destination(kind="on", target="red"),
+            {},
+        )
+        self.assertEqual(reason, "green is not on red")
+
+        measured["green"] = _env_object("green", [-0.22, -0.28, 0.085])
+        self.assertIsNone(
+            track_and_servo._placement_failure(
+                measured,
+                "green",
+                Destination(kind="on", target="red"),
+                {},
+            )
+        )
+
+    def test_stack_phase_ignores_a_stale_box(self):
+        from pseudo_vla.task_plan import Destination
+
+        scene = SimpleNamespace(
+            step=lambda: None,
+            read_sensors=lambda: (
+                np.zeros((8, 8, 3), dtype=np.uint8),
+                np.ones((8, 8)),
+                {},
+            ),
+            camera_path="/World/EnvCamera",
+            last_observed={"green": _env_object("green", [0.0, -0.28, 0.035])},
+        )
+        perception_instance = SimpleNamespace(segment_groups=unittest.mock.Mock())
+        messages = []
+        with patch.object(track_and_servo, "_measure_frame", return_value={}):
+            moved = track_and_servo._run_stack_phase(
+                scene,
+                perception_instance,
+                object(),
+                "red",
+                "green",
+                object(),
+                10,
+                messages.append,
+                lambda _message: None,
+                None,
+                destination=Destination(kind="on", target="red"),
+            )
+
+        self.assertFalse(moved)
+        perception_instance.segment_groups.assert_not_called()
+        self.assertIn("environment camera could not localize red", messages)
 
 
 if __name__ == "__main__":
