@@ -184,12 +184,13 @@ def open_gripper_for_next_command(scene, perception, say, view) -> None:
 
 
 def gripper_place(scene, servo, goal) -> tuple[float, float]:
-    """Return gripper height above the object and horizontal error from its center."""
-    from pseudo_vla.geometry import base_to_world, prim_world_pose
+    """Return axial error along the approach vector and lateral error perpendicular to it."""
+    from pseudo_vla.geometry import quat_to_matrix
 
     hand = servo.hand_position(scene.joint_positions())
-    base_world, base_quat = prim_world_pose(scene.base_path)
-    hand_world = base_to_world(hand.reshape(1, 3), base_world, base_quat)[0]
-    height = float(hand_world[2] - goal.top_z)
-    horizontal = float(np.linalg.norm(hand_world[:2] - goal.center_world[:2]))
-    return height, horizontal
+    delta = hand - goal.position
+    rot = quat_to_matrix(goal.quaternion)
+    z_hand = rot[:, 2]
+    axial = float(np.dot(delta, -z_hand))
+    lateral = float(np.linalg.norm(delta - np.dot(delta, z_hand) * z_hand))
+    return axial, lateral

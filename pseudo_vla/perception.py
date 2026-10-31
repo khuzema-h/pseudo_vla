@@ -13,6 +13,8 @@ from pseudo_vla.geometry import (
     DEPTH_RANGE,
     STANDOFF_Z,
     TOP_DOWN_WXYZ,
+    adaptive_approach_pose,
+    adaptive_grasp_orientation,
     base_to_world,
     mask_depth_points,
     pose_from_depth_points,
@@ -25,6 +27,7 @@ from pseudo_vla.geometry import (
     tracked_surface_top,
     unproject_tracks,
     world_to_base,
+    world_to_base_quat,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -270,6 +273,9 @@ class Perception:
         camera_path: str,
         base_path: str,
         group: str | None = None,
+        object_center: np.ndarray | None = None,
+        grasp_style: str = "auto",
+        tilt_angle_deg: float = 35.0,
     ) -> ApproachGoal | None:
         if group is not None:
             tracks_xy, visible = self.track_group(tracks_xy, visible, group)
@@ -279,11 +285,38 @@ class Perception:
         center_world = np.median(points, axis=0)
         top_z = tracked_surface_top(points)
         base_position, base_quat = prim_world_pose(base_path)
-        goal_world = np.array([center_world[0], center_world[1], top_z + STANDOFF_Z], dtype=np.float64)
+
+        quat_world = adaptive_grasp_orientation(
+            points,
+            object_center=object_center,
+            grasp_style=grasp_style,
+            tilt_angle_deg=tilt_angle_deg,
+        )
+        # For pure top-down grasps, maintain standoff above the top surface
+        if grasp_style == "top_down" or (
+            grasp_style == "auto"
+            and (
+                object_center is None
+                or float(np.linalg.norm(center_world[:2] - np.asarray(object_center)[:2])) <= 0.02
+            )
+        ):
+            target_pt = np.array([center_world[0], center_world[1], top_z], dtype=np.float64)
+            goal_world = adaptive_approach_pose(
+                target_pt, quat_world, standoff=STANDOFF_Z, finger_reach=0.0
+            )
+        else:
+            goal_world = adaptive_approach_pose(
+                center_world, quat_world, standoff=STANDOFF_Z, finger_reach=0.11
+            )
+
         goal_base = world_to_base(goal_world.reshape(1, 3), base_position, base_quat)[0]
-        goal_quat = quat_multiply(quat_inverse(base_quat), TOP_DOWN_WXYZ)
-        goal_quat = goal_quat / np.linalg.norm(goal_quat)
-        return ApproachGoal(position=goal_base, quaternion=goal_quat, center_world=center_world, top_z=top_z)
+        goal_quat = world_to_base_quat(quat_world, base_quat)
+        return ApproachGoal(
+            position=goal_base,
+            quaternion=goal_quat,
+            center_world=center_world,
+            top_z=top_z,
+        )
 
     def tracked_group_points(
         self,

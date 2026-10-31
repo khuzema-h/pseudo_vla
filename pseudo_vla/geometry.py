@@ -50,6 +50,164 @@ def quat_to_matrix(q: np.ndarray) -> np.ndarray:
     )
 
 
+def matrix_to_quat_wxyz(rotation: np.ndarray) -> np.ndarray:
+    """Convert a 3x3 rotation matrix into a normalized [w, x, y, z] quaternion."""
+    rot = np.asarray(rotation, dtype=np.float64)
+    trace = float(np.trace(rot))
+    if trace > 0.0:
+        scale = np.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * scale
+        x = (rot[2, 1] - rot[1, 2]) / scale
+        y = (rot[0, 2] - rot[2, 0]) / scale
+        z = (rot[1, 0] - rot[0, 1]) / scale
+    elif rot[0, 0] > rot[1, 1] and rot[0, 0] > rot[2, 2]:
+        scale = np.sqrt(1.0 + rot[0, 0] - rot[1, 1] - rot[2, 2]) * 2.0
+        w = (rot[2, 1] - rot[1, 2]) / scale
+        x = 0.25 * scale
+        y = (rot[0, 1] + rot[1, 0]) / scale
+        z = (rot[0, 2] + rot[2, 0]) / scale
+    elif rot[1, 1] > rot[2, 2]:
+        scale = np.sqrt(1.0 + rot[1, 1] - rot[0, 0] - rot[2, 2]) * 2.0
+        w = (rot[0, 2] - rot[2, 0]) / scale
+        x = (rot[0, 1] + rot[1, 0]) / scale
+        y = 0.25 * scale
+        z = (rot[1, 2] + rot[2, 1]) / scale
+    else:
+        scale = np.sqrt(1.0 + rot[2, 2] - rot[0, 0] - rot[1, 1]) * 2.0
+        w = (rot[1, 0] - rot[0, 1]) / scale
+        x = (rot[0, 2] + rot[2, 0]) / scale
+        y = (rot[1, 2] + rot[2, 1]) / scale
+        z = 0.25 * scale
+    quat = np.array([w, x, y, z], dtype=np.float64)
+    norm = np.linalg.norm(quat)
+    if norm > 1e-12:
+        quat /= norm
+    return quat
+
+
+def world_to_base_quat(quat_world: np.ndarray, base_quat: np.ndarray) -> np.ndarray:
+    """Transform orientation quaternion from world frame to robot base frame."""
+    q = quat_multiply(quat_inverse(base_quat), quat_world)
+    return q / np.linalg.norm(q)
+
+
+def base_to_world_quat(quat_base: np.ndarray, base_quat: np.ndarray) -> np.ndarray:
+    """Transform orientation quaternion from robot base frame to world frame."""
+    q = quat_multiply(base_quat, quat_base)
+    return q / np.linalg.norm(q)
+
+
+def adaptive_approach_pose(
+    target_point: np.ndarray,
+    quaternion_world: np.ndarray,
+    standoff: float,
+    finger_reach: float = 0.11,
+) -> np.ndarray:
+    """Return panda_hand origin position in world coordinates for a given target and orientation.
+
+    panda_hand link has +Z pointing forward along fingers. When fingers reach distance
+    finger_reach to contact target_point, the hand origin is placed at:
+        target_point - (finger_reach + standoff) * z_hand
+    """
+    rot = quat_to_matrix(quaternion_world)
+    z_hand = rot[:, 2]
+    target = np.asarray(target_point, dtype=np.float64).reshape(3)
+    total_offset = float(finger_reach) + float(standoff)
+    return target - total_offset * z_hand
+
+
+def adaptive_grasp_orientation(
+    points: np.ndarray,
+    object_center: np.ndarray | None = None,
+    grasp_style: str = "auto",
+    tilt_angle_deg: float = 35.0,
+) -> np.ndarray:
+    """Compute adaptive grasp quaternion [w, x, y, z] in world coordinates.
+
+    panda_hand frame convention:
+      +Z points along the fingers toward fingertips (approach vector).
+      +Y is the finger opening / closing axis.
+      +X is the lateral palm axis (wrist camera is mounted at +X = 0.12).
+    """
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    finite = pts[np.isfinite(pts).all(axis=1)]
+    if finite.shape[0] < 3:
+        return TOP_DOWN_WXYZ.copy()
+
+    mean_pt = np.mean(finite, axis=0)
+
+    style = grasp_style.lower()
+    if style == "auto":
+        if object_center is not None:
+            radial_dist = float(
+                np.linalg.norm(mean_pt[:2] - np.asarray(object_center, dtype=np.float64)[:2])
+            )
+            # If grasp point is off-center (e.g. mug handle or rim on tall object), tilt approach
+            if radial_dist > 0.02:
+                style = "tilted"
+            else:
+                style = "top_down"
+        else:
+            style = "top_down"
+
+    if style in {"tilted", "side"}:
+        if object_center is not None:
+            radial_vec = mean_pt[:2] - np.asarray(object_center, dtype=np.float64)[:2]
+        else:
+            radial_vec = mean_pt[:2]
+        rad_norm = float(np.linalg.norm(radial_vec))
+        if rad_norm < 1e-4:
+            u_rad = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        else:
+            u_rad = np.array(
+                [radial_vec[0] / rad_norm, radial_vec[1] / rad_norm, 0.0], dtype=np.float64
+            )
+
+        # Horizontal tangent to the object
+        u_tan = np.array([-u_rad[1], u_rad[0], 0.0], dtype=np.float64)
+
+        if style == "side":
+            z_hand = -u_rad
+            y_hand = u_tan
+            x_hand = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        else:
+            alpha = np.radians(np.clip(tilt_angle_deg, 10.0, 80.0))
+            cos_a = np.cos(alpha)
+            sin_a = np.sin(alpha)
+            # Approach vector points inward (-u_rad) and downward (-Z)
+            z_hand = -cos_a * u_rad - sin_a * np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            z_hand /= np.linalg.norm(z_hand)
+            # Fingers open along the horizontal tangent
+            y_hand = u_tan
+            x_hand = np.cross(y_hand, z_hand)
+            x_hand /= np.linalg.norm(x_hand)
+            # Ensure wrist camera (+X) stays on top, facing down at target
+            if x_hand[2] < 0:
+                y_hand = -y_hand
+                x_hand = np.cross(y_hand, z_hand)
+
+        rot_matrix = np.stack([x_hand, y_hand, z_hand], axis=1)
+        return matrix_to_quat_wxyz(rot_matrix)
+
+    # Top-down grasp with adaptive yaw from PCA
+    z_hand = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+    centered = finite - mean_pt
+    cov = centered.T @ centered / finite.shape[0]
+    cov_xy = cov[:2, :2]
+    eig_xy, vec_xy = np.linalg.eigh(cov_xy)
+    if eig_xy[1] > 2.0 * max(eig_xy[0], 1e-6):
+        major = np.array([vec_xy[0, 1], vec_xy[1, 1], 0.0], dtype=np.float64)
+        major /= np.linalg.norm(major)
+        minor = np.array([-major[1], major[0], 0.0], dtype=np.float64)
+        y_hand = minor
+        x_hand = np.cross(y_hand, z_hand)
+        x_hand /= np.linalg.norm(x_hand)
+        rot_matrix = np.stack([x_hand, y_hand, z_hand], axis=1)
+        return matrix_to_quat_wxyz(rot_matrix)
+
+    return TOP_DOWN_WXYZ.copy()
+
+
 def world_to_base(
     points: np.ndarray,
     base_position: np.ndarray,

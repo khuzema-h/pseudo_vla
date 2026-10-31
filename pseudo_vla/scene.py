@@ -54,7 +54,7 @@ ARM_JOINT_NAMES = list(HOME_ARM)
 # 25 N at a 1 cm gap, and the cap stops the fingers from slamming harder.
 FINGER_GRIP_STIFFNESS = 2500.0
 FINGER_GRIP_DAMPING = 40.0
-FINGER_GRIP_EFFORT = 25.0
+FINGER_GRIP_EFFORT = 10.0
 
 _BLOCKS_TABLE_MIN = TABLE_MIN.copy()
 _BLOCKS_TABLE_MAX = TABLE_MAX.copy()
@@ -353,33 +353,9 @@ def _author_wrist_camera(camera_path: str) -> None:
 
 
 def _matrix_to_quat_wxyz(rotation: np.ndarray) -> np.ndarray:
-    trace = float(np.trace(rotation))
-    if trace > 0.0:
-        scale = np.sqrt(trace + 1.0) * 2.0
-        w = 0.25 * scale
-        x = (rotation[2, 1] - rotation[1, 2]) / scale
-        y = (rotation[0, 2] - rotation[2, 0]) / scale
-        z = (rotation[1, 0] - rotation[0, 1]) / scale
-    elif rotation[0, 0] > rotation[1, 1] and rotation[0, 0] > rotation[2, 2]:
-        scale = np.sqrt(1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]) * 2.0
-        w = (rotation[2, 1] - rotation[1, 2]) / scale
-        x = 0.25 * scale
-        y = (rotation[0, 1] + rotation[1, 0]) / scale
-        z = (rotation[0, 2] + rotation[2, 0]) / scale
-    elif rotation[1, 1] > rotation[2, 2]:
-        scale = np.sqrt(1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]) * 2.0
-        w = (rotation[0, 2] - rotation[2, 0]) / scale
-        x = (rotation[0, 1] + rotation[1, 0]) / scale
-        y = 0.25 * scale
-        z = (rotation[1, 2] + rotation[2, 1]) / scale
-    else:
-        scale = np.sqrt(1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]) * 2.0
-        w = (rotation[1, 0] - rotation[0, 1]) / scale
-        x = (rotation[0, 2] + rotation[2, 0]) / scale
-        y = (rotation[1, 2] + rotation[2, 1]) / scale
-        z = 0.25 * scale
-    quat = np.array([w, x, y, z], dtype=np.float64)
-    return quat / np.linalg.norm(quat)
+    from pseudo_vla.geometry import matrix_to_quat_wxyz
+
+    return matrix_to_quat_wxyz(rotation)
 
 
 def _look_at_wxyz(eye: np.ndarray, target: np.ndarray) -> np.ndarray:

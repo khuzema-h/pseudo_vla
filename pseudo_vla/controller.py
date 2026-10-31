@@ -38,7 +38,7 @@ from pseudo_vla.stacking_workflow import (
 )
 from pseudo_vla.task_workflow import run_task_plan
 
-GRIPPER_FINGER_REACH = 0.11
+GRIPPER_FINGER_REACH = 0.09
 LIFT_HEIGHT = 0.20
 STACK_TRANSIT_CLEARANCE = 0.15
 APPROACH_TRANSIT_RADIUS = 0.35
@@ -479,9 +479,10 @@ def _move_to_prompt(
             scene.set_joint_targets(command)
         if goal is None:
             continue
-        height, horizontal = _gripper_place(scene, servo, goal)
-        if horizontal <= APPROACH_TOLERANCE and abs(height - STANDOFF_Z) <= APPROACH_TOLERANCE:
-            say(f"reached {prompt}, gripper {height:.3f} m above the top")
+        hand_dist = float(np.linalg.norm(servo.hand_position(scene.joint_positions()) - goal.position))
+        axial, lateral = _gripper_place(scene, servo, goal)
+        if hand_dist <= APPROACH_TOLERANCE:
+            say(f"reached {prompt}, gripper at hover waypoint")
             if target_spec is None:
                 say("tracked depth did not match an object measured by the environment camera")
                 return None
@@ -506,18 +507,24 @@ def _move_to_prompt(
     if goal is None:
         say(f"no 3D goal for {prompt}. Check outputs/frame0_overlay.png")
     else:
-        height, horizontal = _gripper_place(scene, servo, goal)
-        say(f"stopped {horizontal:.3f} m to the side and {height:.3f} m above {prompt}")
+        hand_dist = float(np.linalg.norm(servo.hand_position(scene.joint_positions()) - goal.position))
+        say(f"stopped {hand_dist:.3f} m from {prompt} hover waypoint")
     return None
 
 
 def _grasp_and_lift(scene, servo, spec, hover_goal, perception, commands, max_steps: int, say, log, view) -> str | None:
+    from pseudo_vla.geometry import adaptive_approach_pose, base_to_world_quat
     from pseudo_vla.perception import ApproachGoal, prim_world_pose, world_to_base
 
     center_world = hover_goal.center_world.copy()
-    grasp_world = center_world.copy()
-    grasp_world[2] += GRIPPER_FINGER_REACH
     base_world, base_quat = prim_world_pose(scene.base_path)
+    quat_world = base_to_world_quat(hover_goal.quaternion, base_quat)
+    grasp_world = adaptive_approach_pose(
+        center_world,
+        quat_world,
+        standoff=0.0,
+        finger_reach=GRIPPER_FINGER_REACH,
+    )
     grasp_goal = ApproachGoal(
         position=world_to_base(grasp_world.reshape(1, 3), base_world, base_quat)[0],
         quaternion=hover_goal.quaternion.copy(),
@@ -540,17 +547,16 @@ def _grasp_and_lift(scene, servo, spec, hover_goal, perception, commands, max_st
         if incoming:
             return incoming
 
-        top_z = float(hover_goal.top_z)
-        lift_world = center_world.copy()
-        lift_world[2] = top_z + LIFT_HEIGHT
+        lift_world = grasp_world.copy()
+        lift_world[2] += LIFT_HEIGHT
         base_world, base_quat = prim_world_pose(scene.base_path)
         lift_goal = ApproachGoal(
             position=world_to_base(lift_world.reshape(1, 3), base_world, base_quat)[0],
-            quaternion=hover_goal.quaternion.copy(),
+            quaternion=grasp_goal.quaternion.copy(),
             center_world=center_world.copy(),
-            top_z=top_z,
+            top_z=float(hover_goal.top_z),
         )
-        say(f"lifting {spec['name']} to {LIFT_HEIGHT:.2f} m above the block")
+        say(f"lifting {spec['name']} by {LIFT_HEIGHT:.2f} m")
         reached, pending = _execute_pose(scene, servo, lift_goal, perception, commands, max_steps, log, view)
         if pending is not None:
             return pending
@@ -738,6 +744,12 @@ def _stack_tracked_cube(
     destination=None,
     affordance: str | None = None,
 ) -> bool:
+    from pseudo_vla.geometry import (
+        adaptive_approach_pose,
+        adaptive_grasp_orientation,
+        base_to_world_quat,
+        world_to_base_quat,
+    )
     from pseudo_vla.perception import (
         ApproachGoal,
         STANDOFF_Z,
@@ -792,6 +804,12 @@ def _stack_tracked_cube(
         tracked = perception.push_frame(rgb)
         if tracked is not None:
             tracks_xy, visible = tracked
+            obj_center = moving_item.center_world if moving_item is not None else None
+            is_tall_or_mug = (
+                moving_spec.get("kind") in {"asset", "mug", "cup"}
+                or affordance == "hold"
+            )
+            grasp_style = "tilted" if is_tall_or_mug else "auto"
             goal = perception.approach_goal(
                 tracks_xy,
                 visible,
@@ -800,6 +818,8 @@ def _stack_tracked_cube(
                 scene.camera_path,
                 scene.base_path,
                 group="moving",
+                object_center=obj_center,
+                grasp_style=grasp_style,
             )
             if goal is None:
                 log(f"stack approach {moving_name}: fewer than 4 valid CoTracker depth points")
@@ -846,15 +866,15 @@ def _stack_tracked_cube(
             scene.set_joint_targets(command)
         if hover_goal is None:
             continue
-        height, horizontal = _gripper_place(scene, servo, hover_goal)
-        target_height = STANDOFF_Z + (STACK_TRANSIT_CLEARANCE if transit else 0.0)
+        current_hand = servo.hand_position(scene.joint_positions())
+        hand_error = float(np.linalg.norm(current_hand - plan_goal.position))
+        axial, lateral = _gripper_place(scene, servo, plan_goal)
         if step % 16 == 0:
             log(
-                f"stack hover {moving_name}: horizontal error {horizontal:.3f} m, "
-                f"height {height:.3f} m, target {target_height:.3f} m, "
-                f"height error {abs(height - target_height):.3f} m"
+                f"stack hover {moving_name}: goal error {hand_error:.3f} m, "
+                f"axial {axial:.3f} m, lateral {lateral:.3f} m"
             )
-        if horizontal <= APPROACH_TOLERANCE and abs(height - target_height) <= APPROACH_TOLERANCE:
+        if hand_error <= APPROACH_TOLERANCE:
             if transit:
                 transit = False
                 servo.update_goal(hover_goal, scene.joint_positions())
@@ -881,10 +901,19 @@ def _stack_tracked_cube(
                 f"transferred CoTracker points into the wrist camera at "
                 f"{moving_center.round(3).tolist()}"
             )
-        grasp_quaternion = hover_goal.quaternion.copy()
-        align_world = moving_center.copy()
-        align_world[2] = grasp_top + STANDOFF_Z
         base_world, base_quat = prim_world_pose(scene.base_path)
+        quat_world = adaptive_grasp_orientation(
+            source_points,
+            object_center=obj_center,
+            grasp_style=grasp_style,
+        )
+        grasp_quaternion = world_to_base_quat(quat_world, base_quat)
+        align_world = adaptive_approach_pose(
+            moving_center,
+            quat_world,
+            standoff=STANDOFF_Z,
+            finger_reach=GRIPPER_FINGER_REACH,
+        )
         align_goal = ApproachGoal(
             position=world_to_base(align_world.reshape(1, 3), base_world, base_quat)[0],
             quaternion=grasp_quaternion,
@@ -939,9 +968,14 @@ def _stack_tracked_cube(
         moving_center = grasp_alignment.center_world.copy()
         grasp_top = float(grasp_alignment.top_z)
         grasp_quaternion = grasp_alignment.quaternion.copy()
-    grasp_world = moving_center.copy()
-    grasp_world[2] += GRIPPER_FINGER_REACH
     base_world, base_quat = prim_world_pose(scene.base_path)
+    quat_world = base_to_world_quat(grasp_quaternion, base_quat)
+    grasp_world = adaptive_approach_pose(
+        moving_center,
+        quat_world,
+        standoff=0.0,
+        finger_reach=GRIPPER_FINGER_REACH,
+    )
     grasp_goal = ApproachGoal(
         position=world_to_base(grasp_world.reshape(1, 3), base_world, base_quat)[0],
         quaternion=grasp_quaternion,
@@ -978,12 +1012,12 @@ def _stack_tracked_cube(
             authorize_event("grasp", completed=True)
 
         moving_top = grasp_top
-        lift_world = moving_center.copy()
-        lift_world[2] = moving_top + LIFT_HEIGHT
+        lift_world = grasp_world.copy()
+        lift_world[2] += LIFT_HEIGHT
         base_world, base_quat = prim_world_pose(scene.base_path)
         lift_goal = ApproachGoal(
             position=world_to_base(lift_world.reshape(1, 3), base_world, base_quat)[0],
-            quaternion=hover_goal.quaternion.copy(),
+            quaternion=grasp_goal.quaternion.copy(),
             center_world=moving_center.copy(),
             top_z=moving_top,
         )
