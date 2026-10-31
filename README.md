@@ -11,16 +11,17 @@ This was brought up on an RTX 3080 Laptop (16 GB) with Python 3.12 and Torch 2.6
 - Interactive natural-language instructions pass through local Llama
   (`llama3.2:3b`) and are parsed into a validated find request or an ordered
   pick-and-place plan.
-- In the current scene, plans can stack blocks, unstack the tower onto clear
-  table positions, and place a block left or right of another block. The plan
-  validator rejects invalid relations and destinations absent from the scene
-  before robot motion.
+- Plans use a scene-neutral pick-and-place contract: `find`, or ordered moves
+  with destination kind `at`, `on`, `left_of`, `right_of`, or `inside`. Object,
+  location, and container ids come from the current scene state. In this scene
+  those are the red, green, and blue blocks and the `table` location. A plan
+  that names anything else is rejected before robot motion.
 - d3 (`d3:4b`) selects whether each validated task stage proceeds or stops.
   The controller and cuRobo retain responsibility for collision-aware motion,
   grasping, placement, and physical safety; model output is never sent to joints.
-- The scene still contains only red, green, and blue cubes on a table. Box and
-  shelf destinations are represented in the task vocabulary but are rejected
-  until those objects, collision geometry, and placement behavior are added.
+- The scene still contains only red, green, and blue cubes on a table. There
+  are no containers, so an `inside` destination is rejected until a container,
+  its collision geometry, and a placement behavior are added.
 - Automated tests pass. Live Isaac Sim grasp, contact, unstacking, and relative
   placement have not yet been validated end-to-end.
 
@@ -37,7 +38,7 @@ flowchart TD
     D --> F[Find: OWL-ViT, SAM 2, CoTracker, RGB-D]
     F --> A[Approach: tracked pose and wrist RGB-D]
     A --> G[Grasp and lift: controller and cuRobo]
-    G --> P[Place: table, on, left_of, or right_of]
+    G --> P[Place: at, on, left_of, right_of, or inside]
     P --> D
     G -->|Motion or grasp failure| E
     D -->|Stop / model failure| E
@@ -147,7 +148,7 @@ The first Kit launch is slow. Later launches are much faster. At `Instruction>`,
 
 - `find the green block` locates and segments the requested object without moving the arm.
 - `stack blue on red` moves only blue onto red.
-- `unstack the tower` moves top blocks to clear table slots in top-down order, leaving the table-supported base in place.
+- `unstack the tower` asks for supported blocks to be moved to the `table` location, outermost first. Llama sees `supported_by` from the scene; Python accepts the returned ids only when they are in that scene.
 - `put blue to the left of red` or `put green to the right of blue` places blocks beside another block.
 - Type `home` to return the hand to its startup pose, or `quit` to close Kit.
 - Numeric point and box prompts (`x y` or `x1 y1 x2 y2`) remain available for direct visual targeting.
@@ -198,11 +199,11 @@ Logs for each step go to `outputs/run.log`. The first segmented frame is saved t
 - Tracked points identify the selected block, then the scene block bounds define a centered 10 cm hover pose with the hand pointing down.
 - The arm replans when the 3D goal moves. All blocks, including the current target, plus the table, are collision cuboids during approach. Only the selected block is temporarily omitted for intentional finger contact and lifting.
 - After approach, the gripper closes around the selected block and attempts a 20 cm lift. It keeps holding the block until another command arrives, then opens before handling that command. The controller checks whether the block followed the gripper.
-- Free-text instructions pass through Llama as a general find request or an ordered list of pick-and-place actions. The current action contract supports table, on, left_of, and right_of destinations for known blocks. Numeric points/boxes and control commands bypass Llama.
-- Table placements use the moved block's designated initial table slot and are rejected before motion when that slot is occupied. `left_of` and `right_of` currently mean negative and positive scene/world X, with a small collision clearance.
-- Box/shelf targets are recognized as future destination concepts but rejected before motion because those objects are not present in the current scene.
+- Free-text instructions pass through Llama as a find request or an ordered list of pick-and-place actions. Destination kinds are `at`, `on`, `left_of`, `right_of`, and `inside`. The scene state supplies the legal object, location, and container ids. Numeric points/boxes and control commands bypass Llama.
+- In this scene, `at table` uses the moved block's designated initial table slot and is rejected before motion when that slot is occupied. `left_of` and `right_of` mean negative and positive scene/world X, with a small collision clearance.
+- `inside` is rejected before motion because this scene lists no containers.
 - `--stack-prompt` requires red, green, and blue and interprets the requested bottom-to-top order before simulator startup. It runs all requested placements without inter-placement pauses.
 - d3 uses the typed `/v1/systemone` choice API to authorize find, plan, approach, grasp, and place boundaries. Invalid, unavailable, or stop decisions halt the workflow; d3 does not directly command robot joints.
 - Pickup beside a taller nearby block first routes to a higher transit waypoint, then descends to the 10 cm hover pose so the approach clears that block. A block that is already the local high point approaches its hover pose directly.
-- Automated validation: `conda run -n ps_vla python -m unittest discover -s tests -v` passes 57 tests. The suite covers generic task-plan validation, d3 stops, unstack order, relative placement, stack compatibility, and perception helpers.
+- Automated validation: `conda run -n ps_vla python -m unittest discover -s tests -v` passes 56 tests. The suite covers scene-neutral task-plan validation, d3 stops, relative placement, stack compatibility, and perception helpers.
 - Not yet verified: end-to-end grasp, contact, table unstacking, relative placement, and task completion in a live Isaac Sim session. Passing unit tests do not establish physical execution success.

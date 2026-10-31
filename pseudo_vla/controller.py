@@ -211,7 +211,9 @@ def _dispatch_user_prompt(
         if action.destination.target:
             destination += f" {action.destination.target}"
         descriptions.append(f"move {action.object_id} {destination}")
-        if action.destination.kind == "table" and not _table_slot_is_clear(scene, action.object_id):
+        if _is_table_destination(action.destination) and not _table_slot_is_clear(
+            scene, action.object_id
+        ):
             say(
                 f"could not execute plan: table destination for {action.object_id} "
                 "is occupied"
@@ -231,6 +233,9 @@ def _dispatch_user_prompt(
         destination = action.destination
         if destination.kind == "inside":
             say(f"destination {destination.target!r} is not available in this scene")
+            return False
+        if destination.kind == "at" and destination.target != "table":
+            say(f"location {destination.target!r} has no placement behavior in this scene")
             return False
         if destination.kind in {"left_of", "right_of"} and not _relative_slot_is_clear(
             scene, action.object_id, destination
@@ -303,9 +308,10 @@ def _task_scene_state(scene) -> dict[str, object]:
         if supports:
             stacked_on[object_id] = max(supports)[1]
     return {
-        "movable_objects": objects,
-        "stacked_on": stacked_on,
-        "destinations": ["table", "on", "left_of", "right_of"],
+        "objects": objects,
+        "locations": ["table"],
+        "containers": [],
+        "supported_by": stacked_on,
     }
 
 
@@ -577,7 +583,7 @@ def _run_stack_phase(
     scene.step()
     rgb, depth, camera_params = scene.read_sensors()
     prompts = {}
-    target_name = destination.target if destination.kind != "table" else None
+    target_name = None if destination.kind == "at" else destination.target
     tracked_objects = []
     if target_name in {spec["name"].removesuffix("_block") for spec in SCENE_OBJECTS}:
         tracked_objects.append(("support", target_name))
@@ -665,7 +671,7 @@ def _stack_tracked_cube(
         from pseudo_vla.task_plan import Destination
 
         destination = Destination(kind="on", target=support_name)
-    target_name = destination.target if destination.kind != "table" else None
+    target_name = None if destination.kind == "at" else destination.target
     support_spec = specs.get(target_name) if target_name is not None else None
     moving_spec = specs[moving_name]
     moving_dims = object_dims(moving_spec)
@@ -835,7 +841,7 @@ def _stack_tracked_cube(
         preplace_goal = None
         place_goal = None
         say(f"planning {moving_name} placement at {destination_label}")
-        if destination.kind == "table" and not _table_slot_is_clear(scene, moving_name):
+        if _is_table_destination(destination) and not _table_slot_is_clear(scene, moving_name):
             say(f"table destination for {moving_name} is occupied; not moving the block")
             return False
         for step in range(max_steps):
@@ -1008,7 +1014,7 @@ def _relative_placement_goals(scene, moving_name: str, destination, base_path: s
 
     specs = {spec["name"].removesuffix("_block"): spec for spec in SCENE_OBJECTS}
     moving_dims = object_dims(specs[moving_name])
-    if destination.kind == "table":
+    if destination.kind == "at" and destination.target == "table":
         xy = BLOCKS_BY_COLOR[moving_name]["xy"]
         center_world = np.array(
             [xy[0], xy[1], TABLE_TOP_Z + moving_dims[2] / 2.0 + 0.002],
@@ -1051,6 +1057,10 @@ def _relative_placement_goals(scene, moving_name: str, destination, base_path: s
             )
         )
     return goals[0], goals[1]
+
+
+def _is_table_destination(destination) -> bool:
+    return destination.kind == "at" and destination.target == "table"
 
 
 def _needs_approach_transit(scene, moving_name: str) -> bool:

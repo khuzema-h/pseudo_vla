@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 
 from pseudo_vla.stacking_llm import (
     StackingModelError,
@@ -14,7 +13,6 @@ from pseudo_vla.stacking_llm import (
 from pseudo_vla.task_plan import (
     PickPlaceAction,
     TaskPlan,
-    unstack_actions,
     validate_task_plan,
 )
 
@@ -57,23 +55,43 @@ def interpret_task_prompt(user_prompt: str, scene_state: dict[str, object] | Non
         raise StackingModelError(f"Llama returned invalid task plan JSON: {content!r}") from error
     if not isinstance(parsed, dict) or set(parsed) != {"intent", "query", "actions"}:
         raise StackingModelError("Llama task plan must contain only intent, query, and actions")
-    if _is_table_unstack_request(user_prompt):
-        query = parsed["query"] if isinstance(parsed["query"], str) else ""
-        try:
-            return validate_task_plan("pick_place", query, unstack_actions(scene_state))
-        except ValueError as error:
-            raise StackingModelError(f"Could not validate Llama task plan: {error}") from error
+    objects, locations, containers = _scene_catalog(scene_state)
     try:
-        return validate_task_plan(parsed["intent"], parsed["query"], parsed["actions"])
+        return validate_task_plan(
+            parsed["intent"],
+            parsed["query"],
+            parsed["actions"],
+            available_objects=objects,
+            available_locations=locations,
+            available_containers=containers,
+        )
     except ValueError as error:
         raise StackingModelError(f"Could not validate Llama task plan: {error}") from error
 
 
-def _is_table_unstack_request(user_prompt: str) -> bool:
-    """True when the user asked to take a tower down onto clear table positions."""
-    if re.search(r"\bunstack\b", user_prompt, re.IGNORECASE) is None:
-        return False
-    return re.search(r"\b(left|right|box|shelf)\b", user_prompt, re.IGNORECASE) is None
+def _scene_catalog(
+    scene_state: dict[str, object] | None,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Read object, location, and container ids from a scene-state payload."""
+    state = scene_state or {}
+    raw_objects = state.get("objects", state.get("movable_objects", ()))
+    return (
+        _catalog_ids(raw_objects, nested_id=True),
+        _catalog_ids(state.get("locations", ())),
+        _catalog_ids(state.get("containers", ())),
+    )
+
+
+def _catalog_ids(values: object, *, nested_id: bool = False) -> tuple[str, ...]:
+    if not isinstance(values, (list, tuple)):
+        return ()
+    identifiers: list[str] = []
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            identifiers.append(value.strip())
+        elif nested_id and isinstance(value, dict) and isinstance(value.get("id"), str):
+            identifiers.append(value["id"].strip())
+    return tuple(dict.fromkeys(identifiers))
 
 
 def choose_task_event(

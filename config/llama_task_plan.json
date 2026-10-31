@@ -1,6 +1,6 @@
 {
   "model": "llama3.2:3b",
-  "system_prompt": "Interpret the user's instruction as either a request to find one object or an ordered pick-and-place plan. Return intent='find' with a concise visual noun phrase in query and no actions when the user only asks to find, locate, or identify something. Return intent='pick_place' with an explicit ordered actions list when the user asks to move, place, stack, unstack, or rearrange objects. Each action names one object to move and a destination with kind and target. Supported destination kinds are table, on, left_of, right_of, and inside. Table has target ''. on/left_of/right_of target another colored block. inside targets box or shelf. Use only red, green, and blue as movable object identifiers. Do not invent actions, infer missing targets, or change the requested direction. For a stack request, put actions in the requested support-first order. For unstacking a tower, use the provided current scene state, move only blocks that are on another block, topmost first, and place each on the table; leave the table-supported base where it is. If tower order is not known, do not guess. Examples: 'stack blue on red' -> [{object:'blue', destination:{kind:'on', target:'red'}}]. 'unstack the tower' -> move the top block to table, then the next exposed block to table, in order based on the scene's stacked_on relations. 'put blue to the left of red' -> [{object:'blue', destination:{kind:'left_of', target:'red'}}]. 'put green in the box' -> [{object:'green', destination:{kind:'inside', target:'box'}}]. Do not execute actions.",
+  "system_prompt": "Interpret the user's instruction as either a request to find one object or an ordered pick-and-place plan. Return intent='find' with a concise visual noun phrase in query and an empty actions list when the user only asks to find, locate, or identify something. Return intent='pick_place' with an explicit ordered actions list when the user asks to move, place, or rearrange objects. Each action names one object to move and a destination with kind and target. Destination kinds are at, on, left_of, right_of, and inside. at places the object at a named location. on places it on another object. left_of and right_of place it beside another object. inside places it in a container. Copy every object, location, and container identifier from the current scene state. Do not invent identifiers, actions, or destinations, and do not change the requested order or direction. Use supported_by only as observed: when the user asks to clear objects off their supports onto a location, move each supported object before the object that supports it, and leave an object that is not supported by another object where it is unless the user asked to move it. Example shapes, with identifiers that must come from the scene state: move A onto B is {object:'A', destination:{kind:'on', target:'B'}}. Move A to the left of B is {object:'A', destination:{kind:'left_of', target:'B'}}. Move A to location L is {object:'A', destination:{kind:'at', target:'L'}}. Move A inside container C is {object:'A', destination:{kind:'inside', target:'C'}}. Do not execute actions.",
   "response_schema": {
     "type": "object",
     "properties": {
@@ -19,19 +19,17 @@
           "type": "object",
           "properties": {
             "object": {
-              "type": "string",
-              "enum": ["red", "green", "blue"]
+              "type": "string"
             },
             "destination": {
               "type": "object",
               "properties": {
                 "kind": {
                   "type": "string",
-                  "enum": ["table", "on", "left_of", "right_of", "inside"]
+                  "enum": ["at", "on", "left_of", "right_of", "inside"]
                 },
                 "target": {
-                  "type": "string",
-                  "enum": ["", "red", "green", "blue", "box", "shelf"]
+                  "type": "string"
                 }
               },
               "required": ["kind", "target"],

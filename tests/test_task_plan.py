@@ -4,20 +4,32 @@ from pseudo_vla.task_plan import (
     Destination,
     PickPlaceAction,
     TaskPlanError,
-    unstack_actions,
     validate_task_plan,
 )
 
+BLOCKS = ("red", "green", "blue")
+TABLE = ("table",)
+
 
 class TaskPlanTests(unittest.TestCase):
+    def _validate(self, intent, query, actions, **catalog):
+        return validate_task_plan(
+            intent,
+            query,
+            actions,
+            available_objects=catalog.get("available_objects", BLOCKS),
+            available_locations=catalog.get("available_locations", TABLE),
+            available_containers=catalog.get("available_containers", ()),
+        )
+
     def test_validates_find_query(self):
-        plan = validate_task_plan("find", "the blue block", [])
+        plan = self._validate("find", "the blue block", [])
         self.assertEqual(plan.intent, "find")
         self.assertEqual(plan.query, "the blue block")
         self.assertEqual(plan.actions, ())
 
-    def test_validates_stack_and_relative_placement_actions(self):
-        plan = validate_task_plan(
+    def test_validates_support_and_relative_placement_actions(self):
+        plan = self._validate(
             "pick_place",
             "",
             [
@@ -33,33 +45,31 @@ class TaskPlanTests(unittest.TestCase):
             ),
         )
 
-    def test_validates_unstack_actions_in_given_order(self):
-        plan = validate_task_plan(
+    def test_validates_location_placement_in_given_order(self):
+        plan = self._validate(
             "pick_place",
             "",
             [
-                {"object": "blue", "destination": {"kind": "table", "target": ""}},
-                {"object": "green", "destination": {"kind": "table", "target": ""}},
+                {"object": "blue", "destination": {"kind": "at", "target": "table"}},
+                {"object": "green", "destination": {"kind": "at", "target": "table"}},
             ],
         )
         self.assertEqual([action.object_id for action in plan.actions], ["blue", "green"])
+        self.assertTrue(all(action.destination == Destination("at", "table") for action in plan.actions))
 
-    def test_derives_top_down_unstack_order_from_observed_tower(self):
-        actions = unstack_actions(
-            {"stacked_on": {"blue": "green", "red": "blue"}}
+    def test_accepts_identifiers_from_the_supplied_catalog(self):
+        plan = validate_task_plan(
+            "pick_place",
+            "",
+            [{"object": "mug", "destination": {"kind": "inside", "target": "bin"}}],
+            available_objects=("mug",),
+            available_containers=("bin",),
         )
-        self.assertEqual(
-            [action["object"] for action in actions],
-            ["red", "blue"],
-        )
+        self.assertEqual(plan.actions, (PickPlaceAction("mug", Destination("inside", "bin")),))
 
-    def test_rejects_ambiguous_unstack_scene(self):
-        with self.assertRaisesRegex(TaskPlanError, "branching"):
-            unstack_actions({"stacked_on": {"blue": "red", "green": "red"}})
-
-    def test_rejects_unsupported_container_before_motion(self):
+    def test_rejects_container_absent_from_the_catalog(self):
         with self.assertRaisesRegex(TaskPlanError, "not present in the current scene"):
-            validate_task_plan(
+            self._validate(
                 "pick_place",
                 "",
                 [
@@ -77,7 +87,7 @@ class TaskPlanTests(unittest.TestCase):
             (
                 "pick_place",
                 "",
-                [{"object": "purple", "destination": {"kind": "table", "target": ""}}],
+                [{"object": "purple", "destination": {"kind": "at", "target": "table"}}],
             ),
             (
                 "pick_place",
@@ -92,11 +102,16 @@ class TaskPlanTests(unittest.TestCase):
                     {"object": "blue", "destination": {"kind": "on", "target": "red"}},
                 ],
             ),
+            (
+                "pick_place",
+                "",
+                [{"object": "red", "destination": {"kind": "at", "target": "shelf"}}],
+            ),
         )
         for intent, query, actions in invalid:
             with self.subTest(intent=intent, query=query, actions=actions):
                 with self.assertRaises(TaskPlanError):
-                    validate_task_plan(intent, query, actions)
+                    self._validate(intent, query, actions)
 
 
 if __name__ == "__main__":

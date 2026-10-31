@@ -456,7 +456,7 @@ class StackingPerceptionTests(unittest.TestCase):
         plan = TaskPlan(
             intent="pick_place",
             actions=(
-                PickPlaceAction("blue", Destination("table")),
+                PickPlaceAction("blue", Destination("at", "table")),
                 PickPlaceAction("green", Destination("left_of", "red")),
             ),
         )
@@ -484,9 +484,9 @@ class StackingPerceptionTests(unittest.TestCase):
         destinations = [call.args[11] for call in run_phase.call_args_list]
         self.assertEqual(
             [(item.kind, item.target, call.args[4]) for item, call in zip(destinations, run_phase.call_args_list)],
-            [("table", None, "blue"), ("left_of", "red", "green")],
+            [("at", "table", "blue"), ("left_of", "red", "green")],
         )
-        self.assertIn("validated plan: move blue table then move green left_of red", messages)
+        self.assertIn("validated plan: move blue at table then move green left_of red", messages)
 
     def test_occupied_relative_destination_does_not_move(self):
         from pseudo_vla.task_plan import Destination, PickPlaceAction, TaskPlan
