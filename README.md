@@ -198,7 +198,7 @@ Each simulator run saves its terminal output to a new file under `outputs/logs/`
 - One process shares the GPU across Isaac Sim, SAM 2, CoTracker3, OWL-ViT, and cuRobo.
 - SAM 2 and OWL-ViT load once when perception starts and stay resident on the GPU between prompts.
 - CoTracker continues receiving camera frames while idle and during motion, grasping, and lifting; it is reseeded when a new prompt selects an object.
-- Coarse perception uses environment-camera RGB-D; immediately before stacking grasps, wrist-camera RGB-D refines the cube's center and top surface. The UI shows live Jet-colored depth feeds for both cameras in the "Environment + Wrist Depth" window (near pixels are blue, far pixels are red; invalid depth is black).
+- Coarse perception uses environment-camera RGB-D; immediately before stacking grasps, wrist-camera RGB-D refines the cube's center and top surface. The wrist camera and the environment-camera overlay are docked on the right of the scene view.
 - Tracked points identify the selected block, then the scene block bounds define a centered 10 cm hover pose with the hand pointing down.
 - The arm replans when the 3D goal moves. All blocks, including the current target, plus the table, are collision cuboids during approach. Only the selected block is temporarily omitted for intentional finger contact and lifting.
 - After approach, the gripper closes around the selected block and attempts a 20 cm lift. It keeps holding the block until another command arrives, then opens before handling that command. The controller checks whether the block followed the gripper.

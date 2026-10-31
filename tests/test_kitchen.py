@@ -91,6 +91,21 @@ class KitchenSceneTests(unittest.TestCase):
         )
         self.assertEqual([round(float(value), 3) for value in translate], [-0.04, -0.28, 0.95])
 
+    def test_asset_yaw_overrides_the_referenced_rotate(self):
+        stage = Usd.Stage.CreateInMemory()
+        prim = UsdGeom.Xform.Define(stage, "/World/mug").GetPrim()
+        xform = UsdGeom.Xformable(prim)
+        xform.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble).Set(Gf.Vec3d(0.0, 0.0, 0.0))
+        xform.AddRotateXYZOp(UsdGeom.XformOp.PrecisionFloat).Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        xform.AddScaleOp(UsdGeom.XformOp.PrecisionFloat).Set(Gf.Vec3f(0.01, 0.01, 0.01))
+
+        scene._set_yaw(prim, 90.0)
+
+        ops = UsdGeom.Xformable(prim).GetOrderedXformOps()
+        rotate = next(op.Get() for op in ops if op.GetOpType() == UsdGeom.XformOp.TypeRotateXYZ)
+        self.assertEqual([round(float(value), 3) for value in rotate], [0.0, 0.0, 90.0])
+        self.assertEqual(sum(op.GetOpType() == UsdGeom.XformOp.TypeRotateZ for op in ops), 0)
+
     def test_cli_selects_the_kitchen_and_rejects_stack_prompt(self):
         with patch("sys.argv", ["track_and_servo.py", "--scene", "kitchen"]):
             args = cli.parse_args()

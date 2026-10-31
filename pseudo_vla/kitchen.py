@@ -50,6 +50,7 @@ KITCHEN_OBJECTS = (
         "phrase": "mug",
         "kind": "asset",
         "xy": (-0.04, -0.28),
+        "yaw": -90.0,
         "asset": MUG_ASSET,
         "mass": 0.30,
     },

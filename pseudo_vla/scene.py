@@ -52,7 +52,7 @@ ARM_JOINT_NAMES = list(HOME_ARM)
 # A few millimeters of position error at the default drive is too weak to lift
 # the mug. 120 N crushed the handle and pushed it out. 2.5 kN/m asks for about
 # 25 N at a 1 cm gap, and the cap stops the fingers from slamming harder.
-FINGER_GRIP_STIFFNESS = 2500.0
+FINGER_GRIP_STIFFNESS = 5000.0
 FINGER_GRIP_DAMPING = 40.0
 FINGER_GRIP_EFFORT = 10.0
 
@@ -317,6 +317,30 @@ def _show_camera_gizmos() -> None:
     carb.settings.get_settings().set("/app/viewport/show/camera", True)
 
 
+def _frame_scene_view() -> None:
+    """Place the main viewport camera close to the table, looking across the workspace."""
+    from isaacsim.core.rendering_manager import ViewportManager
+
+    target = np.array(
+        [
+            float(TABLE_CENTER[0]),
+            float((ARM_POSITION[1] + TABLE_CENTER[1]) * 0.5),
+            TABLE_TOP_Z + 0.08,
+        ],
+        dtype=np.float64,
+    )
+    eye = np.array(
+        [
+            float(TABLE_CENTER[0]) + 0.65,
+            float(ARM_POSITION[1]) - 0.45,
+            TABLE_TOP_Z + 0.62,
+        ],
+        dtype=np.float64,
+    )
+    ViewportManager.set_camera_view("/OmniverseKit_Persp", eye=eye, target=target)
+    _log(f"scene view eye {eye.round(3).tolist()} looking at {target.round(3).tolist()}")
+
+
 def _author_camera_pose(camera_path: str, translation: tuple[float, float, float], quat_wxyz: tuple[float, float, float, float]) -> None:
     import omni.usd
     from pxr import Gf, UsdGeom
@@ -452,6 +476,53 @@ def _set_translate(prim, translation: tuple[float, float, float]) -> None:
     xform.AddTranslateOp().Set(Gf.Vec3d(*value))
 
 
+def _set_yaw(prim, degrees: float) -> None:
+    """Yaw the prim about world Z, overriding a rotate op the referenced asset already has.
+
+    Isaac mug assets author rotateXYZ at zero. Adding a second rotate op leaves that
+    stack unchanged, so the yaw has to be written into the existing op.
+    """
+    from pxr import Gf, UsdGeom
+
+    if abs(degrees) < 1e-6:
+        return
+    xform = UsdGeom.Xformable(prim)
+    for op in xform.GetOrderedXformOps():
+        op_type = op.GetOpType()
+        if op_type == UsdGeom.XformOp.TypeRotateZ:
+            _set_xform_value(op, degrees)
+            return
+        if op_type in (UsdGeom.XformOp.TypeRotateXYZ, UsdGeom.XformOp.TypeRotateXZY):
+            current = op.Get() or (0.0, 0.0, 0.0)
+            _set_xform_value(op, (float(current[0]), float(current[1]), degrees))
+            return
+        if op_type in (UsdGeom.XformOp.TypeRotateZYX, UsdGeom.XformOp.TypeRotateZXY):
+            current = op.Get() or (0.0, 0.0, 0.0)
+            _set_xform_value(op, (degrees, float(current[1]), float(current[2])))
+            return
+        if op_type == UsdGeom.XformOp.TypeOrient:
+            half = float(np.deg2rad(degrees) / 2.0)
+            quat = (float(np.cos(half)), 0.0, 0.0, float(np.sin(half)))
+            if op.GetPrecision() == UsdGeom.XformOp.PrecisionFloat:
+                op.Set(Gf.Quatf(quat[0], Gf.Vec3f(quat[1], quat[2], quat[3])))
+            else:
+                op.Set(Gf.Quatd(quat[0], Gf.Vec3d(quat[1], quat[2], quat[3])))
+            return
+    xform.AddRotateZOp().Set(float(degrees))
+
+
+def _set_xform_value(op, value: float | tuple[float, float, float]) -> None:
+    from pxr import Gf, UsdGeom
+
+    if isinstance(value, tuple):
+        if op.GetPrecision() == UsdGeom.XformOp.PrecisionFloat:
+            op.Set(Gf.Vec3f(*value))
+        else:
+            op.Set(Gf.Vec3d(*value))
+        return
+    op.Set(float(value))
+
+
 def _place_asset(spec: dict, assets_root: str) -> str:
     """Reference a mesh and seat its bottom on the current work surface."""
     import omni.usd
@@ -465,6 +536,7 @@ def _place_asset(spec: dict, assets_root: str) -> str:
     prim = stage.GetPrimAtPath(path)
     xy = spec["xy"]
     _set_translate(prim, (float(xy[0]), float(xy[1]), TABLE_TOP_Z))
+    _set_yaw(prim, float(spec.get("yaw", 0.0)))
     if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
         UsdPhysics.RigidBodyAPI.Apply(prim)
     mass = UsdPhysics.MassAPI.Apply(prim)
@@ -630,5 +702,6 @@ def build_scene(app, scene_name: str = "blocks") -> FrankaScene:
     for spec in SCENE_OBJECTS:
         _record_prop_bounds(spec)
     _show_camera_gizmos()
+    _frame_scene_view()
     _log("scene ready")
     return scene

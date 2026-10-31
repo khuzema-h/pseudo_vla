@@ -7,7 +7,7 @@ import numpy as np
 from pseudo_vla import controller as track_and_servo
 from pseudo_vla import perception
 from pseudo_vla import stacking_llm
-from pseudo_vla.view import _depth_image
+
 
 class _FakeSam:
     def set_image(self, image):
@@ -38,14 +38,6 @@ class _FakeTracker:
 
 
 class StackingPerceptionTests(unittest.TestCase):
-    def test_depth_feed_maps_near_far_and_invalid_values(self):
-        image = _depth_image(np.array([[1.0, 2.0], [3.0, 0.0]], dtype=np.float32))
-
-        self.assertEqual(image.shape, (2, 2, 3))
-        self.assertGreater(int(image[0, 0, 2]), int(image[0, 0, 0]))
-        self.assertGreater(int(image[1, 0, 0]), int(image[1, 0, 2]))
-        np.testing.assert_array_equal(image[1, 1], [0, 0, 0])
-
     def test_grouped_segmentation_seeds_one_tracker_with_group_slices(self):
         instance = perception.Perception.__new__(perception.Perception)
         instance.sam = _FakeSam()

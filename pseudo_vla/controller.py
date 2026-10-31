@@ -38,7 +38,7 @@ from pseudo_vla.stacking_workflow import (
 )
 from pseudo_vla.task_workflow import run_task_plan
 
-GRIPPER_FINGER_REACH = 0.09
+GRIPPER_FINGER_REACH = 0.07
 LIFT_HEIGHT = 0.20
 STACK_TRANSIT_CLEARANCE = 0.15
 APPROACH_TRANSIT_RADIUS = 0.35

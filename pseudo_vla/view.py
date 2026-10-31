@@ -1,4 +1,4 @@
-"""Isaac Sim camera and perception windows."""
+"""Isaac Sim camera windows docked on the right of the scene view."""
 
 from __future__ import annotations
 
@@ -6,9 +6,12 @@ import numpy as np
 
 from pseudo_vla.perception import compose_overlay
 
+WRIST_WINDOW = "Wrist Camera"
+ENV_WINDOW = "Environment Camera"
+
 
 class PerceptionWindows:
-    """Wrist viewport, environment perception overlay, and both camera depth feeds."""
+    """Wrist viewport and environment-camera overlay, docked as right-side panels."""
 
     def __init__(
         self,
@@ -23,42 +26,17 @@ class PerceptionWindows:
         overlay_width, overlay_height = overlay_resolution
         self.viewport = ViewportManager.create_viewport_window(
             camera=wrist_camera_path,
-            title="Wrist Camera",
+            title=WRIST_WINDOW,
             resolution=wrist_resolution,
         )
-        self.viewport.position_x = 40
-        self.viewport.position_y = 80
         self.viewport.width = width
         self.viewport.height = height
 
         self._provider = ui.ByteImageProvider()
-        self.window = ui.Window("SAM + CoTracker", width=overlay_width + 16, height=overlay_height + 16)
-        self.window.position_x = 64 + width
-        self.window.position_y = 80
+        self.window = ui.Window(ENV_WINDOW, width=overlay_width + 16, height=overlay_height + 16)
         with self.window.frame:
             ui.ImageWithProvider(self._provider, fill_policy=ui.IwpFillPolicy.IWP_STRETCH)
-
-        self._depth_providers = {
-            "environment": ui.ByteImageProvider(),
-            "wrist": ui.ByteImageProvider(),
-        }
-        self.depth_window = ui.Window("Environment + Wrist Depth", width=440, height=280)
-        self.depth_window.position_x = 832
-        self.depth_window.position_y = 80
-        with self.depth_window.frame:
-            with ui.VStack():
-                with ui.HStack():
-                    ui.Label("Environment")
-                    ui.Label("Wrist")
-                with ui.HStack():
-                    ui.ImageWithProvider(
-                        self._depth_providers["environment"],
-                        fill_policy=ui.IwpFillPolicy.IWP_STRETCH,
-                    )
-                    ui.ImageWithProvider(
-                        self._depth_providers["wrist"],
-                        fill_policy=ui.IwpFillPolicy.IWP_STRETCH,
-                    )
+        _dock_camera_panels(self.viewport, self.window)
 
     def update(
         self,
@@ -66,42 +44,35 @@ class PerceptionWindows:
         mask: np.ndarray | None = None,
         points_xy: np.ndarray | None = None,
         visible: np.ndarray | None = None,
-        environment_depth: np.ndarray | None = None,
-        wrist_depth: np.ndarray | None = None,
     ) -> None:
-        if rgb is not None and np.asarray(rgb).size > 0:
-            image = compose_overlay(rgb, mask, points_xy, visible)
-            height, width = image.shape[:2]
-            opaque = np.full((height, width, 1), 255, dtype=np.uint8)
-            rgba = np.concatenate([image, opaque], axis=2)
-            self._provider.set_data_array(np.ascontiguousarray(rgba), [width, height])
-        self._update_depth("environment", environment_depth)
-        self._update_depth("wrist", wrist_depth)
-
-    def _update_depth(self, name: str, depth: np.ndarray | None) -> None:
-        if depth is None or np.asarray(depth).size == 0:
+        if rgb is None or np.asarray(rgb).size == 0:
             return
-        image = _depth_image(depth)
+        image = compose_overlay(rgb, mask, points_xy, visible)
         height, width = image.shape[:2]
         opaque = np.full((height, width, 1), 255, dtype=np.uint8)
         rgba = np.concatenate([image, opaque], axis=2)
-        self._depth_providers[name].set_data_array(np.ascontiguousarray(rgba), [width, height])
+        self._provider.set_data_array(np.ascontiguousarray(rgba), [width, height])
 
 
-def _depth_image(depth: np.ndarray) -> np.ndarray:
-    values = np.asarray(depth, dtype=np.float32)
-    if values.ndim != 2:
-        raise ValueError(f"Depth feed must be a 2D array, got shape {values.shape}")
-    valid = np.isfinite(values) & (values > 0.0)
-    image = np.zeros((*values.shape, 3), dtype=np.uint8)
-    if not np.any(valid):
-        return image
-    near, far = np.percentile(values[valid], [5.0, 95.0])
-    if far <= near:
-        far = near + 1e-6
-    normalized = np.clip((values[valid] - near) / (far - near), 0.0, 1.0)
-    red = np.clip(1.5 - np.abs(4.0 * normalized - 3.0), 0.0, 1.0)
-    green = np.clip(1.5 - np.abs(4.0 * normalized - 2.0), 0.0, 1.0)
-    blue = np.clip(1.5 - np.abs(4.0 * normalized - 1.0), 0.0, 1.0)
-    image[valid] = np.round(np.stack((red, green, blue), axis=1) * 255.0).astype(np.uint8)
-    return image
+def _dock_camera_panels(wrist_window, environment_window) -> None:
+    """Pin both camera windows into a column on the right of the main scene view."""
+    import asyncio
+
+    import omni.kit.app
+    import omni.ui as ui
+
+    async def pin() -> None:
+        app = omni.kit.app.get_app()
+        scene_view = None
+        for _ in range(8):
+            await app.next_update_async()
+            scene_view = ui.Workspace.get_window("Viewport")
+            if scene_view is not None:
+                break
+        if scene_view is None:
+            return
+        wrist_window.dock_in(scene_view, ui.DockPosition.RIGHT, 0.26)
+        await app.next_update_async()
+        environment_window.dock_in(wrist_window, ui.DockPosition.BOTTOM, 0.5)
+
+    asyncio.ensure_future(pin())

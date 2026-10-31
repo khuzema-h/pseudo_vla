@@ -156,22 +156,14 @@ def update_camera_views(
     scene,
     view,
     environment_rgb: np.ndarray,
-    environment_depth: np.ndarray,
+    _environment_depth: np.ndarray,
     mask: np.ndarray | None = None,
     points_xy: np.ndarray | None = None,
     visible: np.ndarray | None = None,
 ) -> None:
     if view is None:
         return
-    _, wrist_depth, _ = scene.read_wrist_sensors()
-    view.update(
-        environment_rgb,
-        mask,
-        points_xy,
-        visible,
-        environment_depth=environment_depth,
-        wrist_depth=wrist_depth,
-    )
+    view.update(environment_rgb, mask, points_xy, visible)
 
 
 def open_gripper_for_next_command(scene, perception, say, view) -> None:
