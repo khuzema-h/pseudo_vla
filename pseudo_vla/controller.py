@@ -1,9 +1,7 @@
-"""Robot controller for finding, stacking, or servoing to colored blocks.
+"""Robot controller for natural-language pick-and-place tasks in Isaac Sim.
 
-The simulation stays open. Type any description and SAM segments it, or type
-`stack` to run the default red, blue, green workflow. Use `--stack-prompt` for
-a Llama-parsed bottom-to-top order orchestrated by d3. Type `home` to return
-the hand to its starting pose, or `quit` to close Kit.
+The simulation stays open for natural-language instructions. Type `home` to
+return the hand to its starting pose, or `quit` to close Kit.
 """
 
 from __future__ import annotations
@@ -36,10 +34,13 @@ from pseudo_vla.stacking_workflow import (
     run_prompted_stack_sequence,
     run_requested_stack_relations,
 )
+from pseudo_vla.task_workflow import run_task_plan
 
 GRIPPER_FINGER_REACH = 0.11
 LIFT_HEIGHT = 0.20
 STACK_TRANSIT_CLEARANCE = 0.15
+APPROACH_TRANSIT_RADIUS = 0.35
+APPROACH_TRANSIT_HEIGHT = 0.02
 QUIT_COMMANDS = {"quit", "exit", "q"}
 
 
@@ -97,9 +98,12 @@ def run(app, args: argparse.Namespace) -> None:
             view = PerceptionWindows(scene.wrist_camera_path, WRIST_RESOLUTION, ENV_RESOLUTION)
             say("opened Wrist Camera and SAM + CoTracker windows")
 
-        say("Type a block color, such as \"red block\", \"green block\", or \"blue block\".")
-        say("Two numbers are a pixel. Four numbers are a box.")
-        say("Commands: stack, home, quit")
+        say(
+            'Enter a pick-and-place instruction, such as "stack blue on red", '
+            '"unstack the tower", or "put blue to the left of red".'
+        )
+        say("The current scene supports red, green, and blue blocks. Box and shelf destinations are not in this scene.")
+        say("Commands: home, quit")
         threading.Thread(target=read_commands, daemon=True).start()
 
         stack_order = getattr(args, "stack_order", None)
@@ -114,11 +118,10 @@ def run(app, args: argparse.Namespace) -> None:
 
         pending = _initial_command(args)
         prompt_shown = False
-        stack_stage = "idle"
         while True:
             if pending is None:
                 if not prompt_shown:
-                    print("> ", end="", flush=True)
+                    print("Instruction> ", end="", flush=True)
                     prompt_shown = True
                 scene.step()
                 rgb, depth, _ = scene.read_sensors()
@@ -136,25 +139,6 @@ def run(app, args: argparse.Namespace) -> None:
                 return
             if scene.gripper_closed:
                 _open_gripper_for_next_command(scene, perception, say, view)
-            if stack_stage == "await_green":
-                if command not in {"continue", "green", "green cube"}:
-                    say("blue is stacked on red; type continue to stack green on blue, or quit")
-                    continue
-                complete = _run_stack_phase(
-                    scene, perception, servo, "blue", "green", commands, args.max_steps, say, log, view
-                )
-                if complete:
-                    stack_stage = "idle"
-                    say("stack complete; object prompts are available")
-                continue
-            if command == "stack":
-                complete = _run_stack_phase(
-                    scene, perception, servo, "red", "blue", commands, args.max_steps, say, log, view
-                )
-                if complete:
-                    stack_stage = "await_green"
-                    say("blue is stacked on red; type continue when ready to stack green on blue")
-                continue
             if command == "home":
                 pending = _home(scene, perception, servo, commands, args.max_steps, say, log, view)
                 continue
@@ -177,7 +161,7 @@ def run(app, args: argparse.Namespace) -> None:
 
 
 def _initial_command(args: argparse.Namespace) -> str | None:
-    return args.target
+    return getattr(args, "instruction", None) or getattr(args, "target", None)
 
 
 def _dispatch_user_prompt(
@@ -197,56 +181,156 @@ def _dispatch_user_prompt(
             scene, perception, servo, prompt, commands, max_steps, say, log, view
         )
 
-    from pseudo_vla.stacking_llm import StackingModelError, interpret_user_prompt
+    from pseudo_vla.stacking_llm import StackingModelError
+    from pseudo_vla.task_llm import interpret_task_prompt
 
     try:
-        parsed = interpret_user_prompt(prompt)
+        parsed = interpret_task_prompt(prompt, _task_scene_state(scene))
     except (StackingModelError, ValueError) as error:
         say(f"could not interpret prompt with Llama: {error}")
         return None
 
-    if parsed.intent == "stack_blocks":
-        if not parsed.stacking_relations:
-            say("Llama returned a stack request without any requested placements")
-            return None
-        plan = " then ".join(
-            f"{relation.moving} on {relation.support}"
-            for relation in parsed.stacking_relations
+    if parsed.intent == "find":
+        say(f'LLM planned to find "{parsed.query}"')
+
+        def find_object(query):
+            return _find_object(scene, perception, prompt, query, say, view)
+
+        complete = run_task_plan(
+            parsed,
+            say,
+            find_object,
+            lambda _action, _authorize: False,
         )
-        say(f"interpreted requested placements: {plan}")
-        complete = _run_requested_stack_relations(
+        say("find task complete" if complete else "find task stopped")
+        return None
+
+    descriptions = []
+    for action in parsed.actions:
+        destination = action.destination.kind
+        if action.destination.target:
+            destination += f" {action.destination.target}"
+        descriptions.append(f"move {action.object_id} {destination}")
+        if action.destination.kind == "table" and not _table_slot_is_clear(scene, action.object_id):
+            say(
+                f"could not execute plan: table destination for {action.object_id} "
+                "is occupied"
+            )
+            return None
+        if action.destination.kind in {"left_of", "right_of"} and not _relative_slot_is_clear(
+            scene, action.object_id, action.destination
+        ):
+            say(
+                f"could not execute plan: destination {action.destination.kind} "
+                f"{action.destination.target} is occupied"
+            )
+            return None
+    say("validated plan: " + " then ".join(descriptions))
+
+    def execute_action(action, authorize_event):
+        destination = action.destination
+        if destination.kind == "inside":
+            say(f"destination {destination.target!r} is not available in this scene")
+            return False
+        if destination.kind in {"left_of", "right_of"} and not _relative_slot_is_clear(
+            scene, action.object_id, destination
+        ):
+            say(
+                f"destination {destination.kind} {destination.target} is occupied; "
+                "not moving the block"
+            )
+            return False
+        if destination.kind == "on":
+            support_name = destination.target
+        else:
+            support_name = destination.target
+
+        def authorize_stack_stage(stage, completed=False):
+            if stage in {"lift", "verify_placement"}:
+                return True
+            return authorize_event(stage, completed)
+
+        return _run_stack_phase(
             scene,
             perception,
             servo,
-            parsed.stacking_relations,
+            support_name,
+            action.object_id,
             commands,
             max_steps,
             say,
             log,
             view,
+            authorize_stack_stage,
+            destination,
         )
-        if complete:
-            say("prompted stack complete; object prompts are available")
-        else:
-            say("prompted stack stopped; returning to the interactive prompt")
-        return None
 
-    if parsed.query is None:
-        say("Llama returned an object-search request without a grounding query")
-        return None
-    say(f'LLM interpreted object prompt as "{parsed.query}"')
-    return _move_to_prompt(
-        scene,
-        perception,
-        servo,
-        prompt,
-        commands,
-        max_steps,
+    complete = run_task_plan(
+        parsed,
         say,
-        log,
-        view,
-        grounding_prompt=parsed.query,
+        lambda _query: False,
+        execute_action,
     )
+    say("task plan complete" if complete else "task plan stopped safely")
+    return None
+
+
+def _task_scene_state(scene) -> dict[str, object]:
+    from pseudo_vla.perception import prim_world_pose
+    from pseudo_vla.scene import SCENE_OBJECTS
+
+    objects = []
+    centers = {}
+    for spec in SCENE_OBJECTS:
+        center, _ = prim_world_pose(scene.object_paths[spec["name"]])
+        object_id = spec["name"].removesuffix("_block")
+        centers[object_id] = center
+        objects.append(
+            {
+                "id": object_id,
+                "position_world_m": [round(float(value), 4) for value in center],
+            }
+        )
+    stacked_on = {}
+    for object_id, center in centers.items():
+        supports = [
+            (float(candidate[2]), candidate_id)
+            for candidate_id, candidate in centers.items()
+            if candidate_id != object_id
+            and 0.03 <= float(center[2] - candidate[2]) <= 0.08
+            and float(np.linalg.norm(center[:2] - candidate[:2])) <= 0.035
+        ]
+        if supports:
+            stacked_on[object_id] = max(supports)[1]
+    return {
+        "movable_objects": objects,
+        "stacked_on": stacked_on,
+        "destinations": ["table", "on", "left_of", "right_of"],
+    }
+
+
+def _find_object(scene, perception, prompt: str, query: str, say, view) -> bool:
+    from pseudo_vla.perception import save_overlay
+
+    scene.step()
+    rgb, depth, _ = scene.read_sensors()
+    if rgb.size == 0 or depth.size == 0:
+        say("could not find object: environment camera has no RGB-D frame")
+        return False
+    point, box = _prompt_to_sam(
+        perception,
+        rgb,
+        prompt,
+        say,
+        grounding_prompt=query,
+    )
+    if point is None and box is None:
+        return False
+    queries = perception.segment(rgb, point, box)
+    save_overlay(ROOT / "outputs" / "frame0_overlay.png", rgb, perception.mask, queries)
+    _update_camera_views(scene, view, rgb, depth, perception.mask, queries)
+    say(f'found "{query}" in the environment camera')
+    return True
 
 
 def _run_requested_stack_relations(
@@ -475,7 +559,7 @@ def _run_stack_phase(
     scene,
     perception,
     servo,
-    support_name: str,
+    support_name: str | None,
     moving_name: str,
     commands,
     max_steps: int,
@@ -483,27 +567,36 @@ def _run_stack_phase(
     log,
     view,
     authorize_event=None,
+    destination=None,
 ) -> bool:
+    from pseudo_vla.task_plan import Destination
+    from pseudo_vla.scene import SCENE_OBJECTS
+
+    if destination is None:
+        destination = Destination(kind="on", target=support_name)
     scene.step()
     rgb, depth, camera_params = scene.read_sensors()
     prompts = {}
-    for group_name, object_name in (("support", support_name), ("moving", moving_name)):
+    target_name = destination.target if destination.kind != "table" else None
+    tracked_objects = []
+    if target_name in {spec["name"].removesuffix("_block") for spec in SCENE_OBJECTS}:
+        tracked_objects.append(("support", target_name))
+    tracked_objects.append(("moving", moving_name))
+    for group_name, object_name in tracked_objects:
         point, box = _projected_cube_prompt(scene, rgb, camera_params, object_name, say)
         if point is None and box is None:
             return False
         prompts[group_name] = (point, box)
 
     perception.segment_groups(rgb, prompts)
-    if moving_name == "green":
-        perception.retain_groups(rgb, ("moving",))
     _update_camera_views(scene, view, rgb, depth, perception.mask, perception.query_xy)
-    if moving_name == "green":
-        say(f"tracking {moving_name} only until pickup with {len(perception.query_xy)} CoTracker points")
-    else:
+    if target_name is not None:
         say(
-            f"tracking {support_name} support and {moving_name} cube with "
+            f"tracking {target_name} target and {moving_name} cube with "
             f"{len(perception.query_xy)} CoTracker points"
         )
+    else:
+        say(f"tracking {moving_name} cube with {len(perception.query_xy)} CoTracker points")
     return _stack_tracked_cube(
         scene,
         perception,
@@ -516,6 +609,7 @@ def _run_stack_phase(
         log,
         view,
         authorize_event,
+        destination,
     )
 
 
@@ -548,7 +642,7 @@ def _stack_tracked_cube(
     scene,
     perception,
     servo,
-    support_name: str,
+    support_name: str | None,
     moving_name: str,
     commands,
     max_steps: int,
@@ -556,6 +650,7 @@ def _stack_tracked_cube(
     log,
     view,
     authorize_event=None,
+    destination=None,
 ) -> bool:
     from pseudo_vla.perception import (
         ApproachGoal,
@@ -566,15 +661,23 @@ def _stack_tracked_cube(
     from pseudo_vla.scene import SCENE_OBJECTS, object_dims
 
     specs = {spec["name"].removesuffix("_block"): spec for spec in SCENE_OBJECTS}
-    support_spec = specs[support_name]
+    if destination is None:
+        from pseudo_vla.task_plan import Destination
+
+        destination = Destination(kind="on", target=support_name)
+    target_name = destination.target if destination.kind != "table" else None
+    support_spec = specs.get(target_name) if target_name is not None else None
     moving_spec = specs[moving_name]
     moving_dims = object_dims(moving_spec)
     hover_goal = None
-    transit = moving_name == "green"
+    transit = _needs_approach_transit(scene, moving_name)
 
     if authorize_event is not None and not authorize_event("approach"):
         return False
-    say(f"approaching {moving_name} while tracking {support_name} as the placement target")
+    destination_label = destination.kind
+    if destination.target:
+        destination_label = f"{destination.kind} {destination.target}"
+    say(f"approaching {moving_name} for destination {destination_label}")
     servo.clear()
     for step in range(max_steps):
         incoming = _poll(commands)
@@ -654,7 +757,7 @@ def _stack_tracked_cube(
         scene, servo, wrist_hover_goal, perception, commands, max_steps, log, view
     )
     if pending is not None:
-        say(f"stack phase interrupted by {pending}")
+        say(f"pick-and-place interrupted by {pending}")
         commands.put(pending)
         return False
     if not reached:
@@ -688,18 +791,19 @@ def _stack_tracked_cube(
         reached, pending = _execute_pose(scene, servo, grasp_goal, perception, commands, max_steps, log, view)
         if pending is not None or not reached:
             if pending is not None:
-                say(f"stack phase interrupted by {pending}")
+                say(f"pick-and-place interrupted by {pending}")
                 commands.put(pending)
             else:
                 say(f"could not lower the gripper to grasp {moving_name}")
             return False
         scene.set_gripper_closed(True)
+        retained_groups = ("support",) if destination.kind == "on" else None
         _settle_tracker(
             scene,
             perception,
             GRIPPER_SETTLE_STEPS,
             view,
-            retain_groups=("support",),
+            retain_groups=retained_groups,
         )
         if authorize_event is not None:
             authorize_event("grasp", completed=True)
@@ -720,7 +824,7 @@ def _stack_tracked_cube(
         reached, pending = _execute_pose(scene, servo, lift_goal, perception, commands, max_steps, log, view)
         if pending is not None or not reached:
             if pending is not None:
-                say(f"stack phase interrupted by {pending}")
+                say(f"pick-and-place interrupted by {pending}")
                 commands.put(pending)
             else:
                 say(f"could not lift {moving_name}")
@@ -730,7 +834,10 @@ def _stack_tracked_cube(
 
         preplace_goal = None
         place_goal = None
-        say(f"tracking {support_name} to plan the {moving_name} placement")
+        say(f"planning {moving_name} placement at {destination_label}")
+        if destination.kind == "table" and not _table_slot_is_clear(scene, moving_name):
+            say(f"table destination for {moving_name} is occupied; not moving the block")
+            return False
         for step in range(max_steps):
             incoming = _poll(commands)
             if incoming:
@@ -739,8 +846,11 @@ def _stack_tracked_cube(
             scene.step()
             rgb, depth, camera_params = scene.read_sensors()
             tracked = perception.push_frame(rgb)
+            tracks_xy = None
+            visible = None
             if tracked is not None:
                 tracks_xy, visible = tracked
+            if destination.kind == "on" and tracks_xy is not None:
                 support_points = perception.tracked_group_points(
                     "support", tracks_xy, visible, depth, camera_params, scene.camera_path
                 )
@@ -751,6 +861,11 @@ def _stack_tracked_cube(
                         scene.base_path,
                     )
                     servo.update_goal(preplace_goal, scene.joint_positions())
+            elif destination.kind != "on":
+                preplace_goal, place_goal = _relative_placement_goals(
+                    scene, moving_name, destination, scene.base_path
+                )
+                servo.update_goal(preplace_goal, scene.joint_positions())
             command = servo.command()
             if command:
                 scene.set_joint_targets(command)
@@ -759,40 +874,50 @@ def _stack_tracked_cube(
                 view,
                 rgb,
                 depth,
-                None if tracked is not None else perception.mask,
-                tracks_xy if tracked is not None else perception.query_xy,
-                visible if tracked is not None else None,
+                None if tracks_xy is not None else perception.mask,
+                tracks_xy if tracks_xy is not None else perception.query_xy,
+                visible,
             )
             if preplace_goal is not None and float(
                 np.linalg.norm(servo.hand_position(scene.joint_positions()) - preplace_goal.position)
             ) <= APPROACH_TOLERANCE:
                 break
         else:
-            say(f"could not reach a tracked placement waypoint above {support_name}")
+            say(f"could not reach the placement waypoint for {destination_label}")
             return False
 
         assert place_goal is not None and preplace_goal is not None
+        if destination.kind in {"left_of", "right_of"} and not _relative_slot_is_clear(
+            scene, moving_name, destination
+        ):
+            say(
+                f"destination {destination.kind} {destination.target} is occupied; "
+                "not releasing the block"
+            )
+            return False
         if authorize_event is not None and not authorize_event("place"):
             return False
-        servo.set_obstacle_enabled(support_spec["name"], False)
+        if destination.kind == "on" and support_spec is not None:
+            servo.set_obstacle_enabled(support_spec["name"], False)
         try:
-            say(f"lowering {moving_name} onto tracked {support_name} target")
+            say(f"placing {moving_name} at {destination_label}")
             reached, pending = _execute_pose(
                 scene, servo, place_goal, perception, commands, max_steps, log, view
             )
             if pending is not None or not reached:
                 if pending is not None:
-                    say(f"stack phase interrupted by {pending}")
+                    say(f"pick-and-place interrupted by {pending}")
                     commands.put(pending)
                 else:
-                    say(f"could not lower {moving_name} onto {support_name}")
+                    say(f"could not place {moving_name} at {destination_label}")
                 return False
             scene.set_gripper_closed(False)
             _settle_tracker(scene, perception, GRIPPER_SETTLE_STEPS, view)
             if authorize_event is not None:
                 authorize_event("place", completed=True)
         finally:
-            servo.set_obstacle_enabled(support_spec["name"], True)
+            if destination.kind == "on" and support_spec is not None:
+                servo.set_obstacle_enabled(support_spec["name"], True)
 
         reached, pending = _execute_pose(
             scene, servo, preplace_goal, perception, commands, max_steps, log, view
@@ -808,7 +933,7 @@ def _stack_tracked_cube(
             return False
         if authorize_event is not None:
             authorize_event("verify_placement", completed=True)
-        say(f"placed {moving_name} on {support_name}")
+        say(f"placed {moving_name} at {destination_label}")
         return True
     finally:
         servo.set_obstacle_enabled(moving_spec["name"], True)
@@ -866,6 +991,139 @@ def _stack_placement_goals(support_points: np.ndarray, moving_dims: np.ndarray, 
         top_z=support_top + moving_dims[2],
     )
     return preplace, place
+
+
+def _relative_placement_goals(scene, moving_name: str, destination, base_path: str):
+    from pseudo_vla.blocks import BLOCKS_BY_COLOR
+    from pseudo_vla.perception import (
+        ApproachGoal,
+        STANDOFF_Z,
+        TOP_DOWN_WXYZ,
+        prim_world_pose,
+        quat_inverse,
+        quat_multiply,
+        world_to_base,
+    )
+    from pseudo_vla.scene import TABLE_TOP_Z, object_dims, SCENE_OBJECTS
+
+    specs = {spec["name"].removesuffix("_block"): spec for spec in SCENE_OBJECTS}
+    moving_dims = object_dims(specs[moving_name])
+    if destination.kind == "table":
+        xy = BLOCKS_BY_COLOR[moving_name]["xy"]
+        center_world = np.array(
+            [xy[0], xy[1], TABLE_TOP_Z + moving_dims[2] / 2.0 + 0.002],
+            dtype=np.float64,
+        )
+    else:
+        target_name = destination.target
+        if target_name is None or target_name not in specs:
+            raise ValueError(f"Unresolved placement target {target_name!r}")
+        target_center, _ = prim_world_pose(scene.object_paths[specs[target_name]["name"]])
+        target_dims = object_dims(specs[target_name])
+        center_world = target_center.copy()
+        if destination.kind in {"left_of", "right_of"}:
+            # Robot faces +Y, so its left is world -X and its right is world +X.
+            direction = -1.0 if destination.kind == "left_of" else 1.0
+            center_world[0] += direction * (
+                target_dims[0] / 2.0 + moving_dims[0] / 2.0 + 0.02
+            )
+        elif destination.kind == "on":
+            center_world[2] += target_dims[2] / 2.0 + moving_dims[2] / 2.0
+        else:
+            raise ValueError(f"Unsupported destination kind {destination.kind!r}")
+
+    top_z = float(center_world[2] + moving_dims[2] / 2.0)
+    place_world = center_world.copy()
+    place_world[2] = top_z - moving_dims[2] / 2.0 + GRIPPER_FINGER_REACH
+    preplace_world = place_world.copy()
+    preplace_world[2] += STANDOFF_Z
+    base_world, base_quat = prim_world_pose(base_path)
+    quaternion = quat_multiply(quat_inverse(base_quat), TOP_DOWN_WXYZ)
+    quaternion /= np.linalg.norm(quaternion)
+    goals = []
+    for point in (preplace_world, place_world):
+        goals.append(
+            ApproachGoal(
+                position=world_to_base(point.reshape(1, 3), base_world, base_quat)[0],
+                quaternion=quaternion.copy(),
+                center_world=center_world.copy(),
+                top_z=top_z,
+            )
+        )
+    return goals[0], goals[1]
+
+
+def _needs_approach_transit(scene, moving_name: str) -> bool:
+    """Route the approach above the block when a nearby block is taller."""
+    from pseudo_vla.perception import prim_world_pose
+    from pseudo_vla.scene import SCENE_OBJECTS, object_dims
+
+    specs = {spec["name"].removesuffix("_block"): spec for spec in SCENE_OBJECTS}
+    moving_center, _ = prim_world_pose(scene.object_paths[specs[moving_name]["name"]])
+    moving_top = float(moving_center[2] + object_dims(specs[moving_name])[2] / 2.0)
+    for name, spec in specs.items():
+        if name == moving_name:
+            continue
+        center, _ = prim_world_pose(scene.object_paths[spec["name"]])
+        if float(np.linalg.norm(center[:2] - moving_center[:2])) > APPROACH_TRANSIT_RADIUS:
+            continue
+        other_top = float(center[2] + object_dims(spec)[2] / 2.0)
+        if other_top > moving_top + APPROACH_TRANSIT_HEIGHT:
+            return True
+    return False
+
+
+def _table_slot_is_clear(scene, moving_name: str) -> bool:
+    from pseudo_vla.blocks import BLOCKS_BY_COLOR
+    from pseudo_vla.perception import prim_world_pose
+    from pseudo_vla.scene import SCENE_OBJECTS, object_dims
+
+    target_xy = np.asarray(BLOCKS_BY_COLOR[moving_name]["xy"], dtype=np.float64)
+    moving_dims = object_dims(
+        next(spec for spec in SCENE_OBJECTS if spec["name"] == f"{moving_name}_block")
+    )
+    for spec in SCENE_OBJECTS:
+        other_name = spec["name"].removesuffix("_block")
+        if other_name == moving_name:
+            continue
+        center, _ = prim_world_pose(scene.object_paths[spec["name"]])
+        other_dims = object_dims(spec)
+        minimum_clearance = (moving_dims[0] + other_dims[0]) / 2.0 + 0.01
+        if np.linalg.norm(center[:2] - target_xy) < minimum_clearance:
+            return False
+    return True
+
+
+def _relative_slot_is_clear(scene, moving_name: str, destination) -> bool:
+    from pseudo_vla.perception import prim_world_pose
+    from pseudo_vla.scene import SCENE_OBJECTS, object_dims
+
+    _, place_goal = _relative_placement_goals(
+        scene, moving_name, destination, scene.base_path
+    )
+    target_center = place_goal.center_world
+    moving_spec = next(
+        spec for spec in SCENE_OBJECTS if spec["name"] == f"{moving_name}_block"
+    )
+    moving_dims = object_dims(moving_spec)
+    target_name = destination.target
+    for spec in SCENE_OBJECTS:
+        other_name = spec["name"].removesuffix("_block")
+        if other_name in {moving_name, target_name}:
+            continue
+        center, _ = prim_world_pose(scene.object_paths[spec["name"]])
+        other_dims = object_dims(spec)
+        overlaps = (
+            abs(float(target_center[0] - center[0]))
+            < (moving_dims[0] + other_dims[0]) / 2.0 + 0.005
+            and abs(float(target_center[1] - center[1]))
+            < (moving_dims[1] + other_dims[1]) / 2.0 + 0.005
+            and abs(float(target_center[2] - center[2]))
+            < (moving_dims[2] + other_dims[2]) / 2.0
+        )
+        if overlaps:
+            return False
+    return True
 
 
 def _prompt_to_sam(

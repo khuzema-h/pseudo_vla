@@ -517,6 +517,22 @@ class StackingLlmTests(unittest.TestCase):
 
         self.assertEqual(exit_error.exception.code, 2)
 
+    def test_instruction_and_legacy_target_are_mutually_exclusive(self):
+        with patch(
+            "sys.argv",
+            [
+                "track_and_servo.py",
+                "--instruction",
+                "stack blue on red",
+                "--target",
+                "green block",
+            ],
+        ):
+            with self.assertRaises(SystemExit) as exit_error:
+                cli.parse_args()
+
+        self.assertEqual(exit_error.exception.code, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

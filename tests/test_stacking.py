@@ -126,6 +126,139 @@ class StackingPerceptionTests(unittest.TestCase):
         np.testing.assert_allclose(place, [0.41, 0.11, 0.355])
         np.testing.assert_allclose(preplace, [0.41, 0.11, 0.455])
 
+    def test_relative_placement_goals_place_left_of_target(self):
+        from pseudo_vla.task_plan import Destination
+
+        scene = SimpleNamespace(object_paths={"red_block": "/red"})
+        with (
+            patch(
+                "pseudo_vla.perception.prim_world_pose",
+                side_effect=[
+                    (np.array([0.0, -0.3, 0.05]), np.array([1.0, 0.0, 0.0, 0.0])),
+                    (np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])),
+                ],
+            ),
+            patch("pseudo_vla.perception.world_to_base", side_effect=lambda points, *_: points),
+            patch("pseudo_vla.perception.quat_inverse", return_value=np.array([1.0, 0.0, 0.0, 0.0])),
+            patch("pseudo_vla.perception.quat_multiply", return_value=np.array([1.0, 0.0, 0.0, 0.0])),
+            patch("pseudo_vla.scene.object_dims", return_value=np.array([0.05, 0.05, 0.05])),
+        ):
+            preplace, place = track_and_servo._relative_placement_goals(
+                scene, "blue", Destination("left_of", "red"), "/base"
+            )
+
+        np.testing.assert_allclose(place.center_world, [-0.07, -0.3, 0.05])
+        self.assertAlmostEqual(place.position[2], 0.16)
+        self.assertAlmostEqual(preplace.position[2], 0.26)
+
+    def test_relative_placement_goals_place_right_of_target(self):
+        from pseudo_vla.task_plan import Destination
+
+        scene = SimpleNamespace(object_paths={"red_block": "/red"})
+        with (
+            patch(
+                "pseudo_vla.perception.prim_world_pose",
+                side_effect=[
+                    (np.array([0.0, -0.3, 0.05]), np.array([1.0, 0.0, 0.0, 0.0])),
+                    (np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])),
+                ],
+            ),
+            patch("pseudo_vla.perception.world_to_base", side_effect=lambda points, *_: points),
+            patch("pseudo_vla.perception.quat_inverse", return_value=np.array([1.0, 0.0, 0.0, 0.0])),
+            patch("pseudo_vla.perception.quat_multiply", return_value=np.array([1.0, 0.0, 0.0, 0.0])),
+            patch("pseudo_vla.scene.object_dims", return_value=np.array([0.05, 0.05, 0.05])),
+        ):
+            _preplace, place = track_and_servo._relative_placement_goals(
+                scene, "blue", Destination("right_of", "red"), "/base"
+            )
+
+        np.testing.assert_allclose(place.center_world, [0.07, -0.3, 0.05])
+
+    def test_table_slot_clearance_detects_other_block(self):
+        centers = {
+            "/World/red_block": (np.array([-0.22, -0.28, 0.035]), None),
+            "/World/green_block": (np.array([0.22, -0.28, 0.035]), None),
+            "/World/blue_block": (np.array([0.0, -0.28, 0.035]), None),
+        }
+        scene = SimpleNamespace(
+            object_paths={
+                "red_block": "/World/red_block",
+                "green_block": "/World/green_block",
+                "blue_block": "/World/blue_block",
+            }
+        )
+        with patch(
+            "pseudo_vla.perception.prim_world_pose",
+            side_effect=lambda path: centers[path],
+        ), patch("pseudo_vla.scene.object_dims", return_value=np.array([0.05, 0.05, 0.05])):
+            self.assertFalse(track_and_servo._table_slot_is_clear(scene, "blue"))
+            centers["/World/green_block"] = (
+                np.array([0.0, -0.28, 0.035]),
+                None,
+            )
+            self.assertTrue(track_and_servo._table_slot_is_clear(scene, "blue"))
+
+    def test_relative_placement_clearance_detects_block_in_destination(self):
+        from pseudo_vla.task_plan import Destination
+
+        centers = {
+            "/red": (np.array([0.0, -0.3, 0.05]), None),
+            "/green": (np.array([-0.07, -0.3, 0.05]), None),
+            "/blue": (np.array([0.2, -0.3, 0.05]), None),
+        }
+        scene = SimpleNamespace(
+            base_path="/base",
+            object_paths={
+                "red_block": "/red",
+                "green_block": "/green",
+                "blue_block": "/blue",
+            },
+        )
+        destination = Destination("left_of", "red")
+        with (
+            patch.object(
+                track_and_servo,
+                "_relative_placement_goals",
+                return_value=(
+                    SimpleNamespace(center_world=np.zeros(3)),
+                    SimpleNamespace(center_world=np.array([-0.07, -0.3, 0.05])),
+                ),
+            ),
+            patch(
+                "pseudo_vla.perception.prim_world_pose",
+                side_effect=lambda path: centers[path],
+            ),
+            patch("pseudo_vla.scene.object_dims", return_value=np.array([0.05, 0.05, 0.05])),
+        ):
+            self.assertFalse(
+                track_and_servo._relative_slot_is_clear(scene, "blue", destination)
+            )
+            centers["/green"] = (np.array([0.0, -0.5, 0.05]), None)
+            self.assertTrue(
+                track_and_servo._relative_slot_is_clear(scene, "blue", destination)
+            )
+
+    def test_approach_transit_follows_nearby_taller_blocks(self):
+        centers = {
+            "red_block": np.array([-0.22, -0.28, 0.035]),
+            "green_block": np.array([0.0, -0.28, 0.035]),
+            "blue_block": np.array([-0.22, -0.28, 0.085]),
+        }
+        scene = SimpleNamespace(object_paths={name: name for name in centers})
+
+        def pose(path):
+            return centers[path], None
+
+        with (
+            patch("pseudo_vla.perception.prim_world_pose", side_effect=pose),
+            patch("pseudo_vla.scene.object_dims", return_value=np.array([0.05, 0.05, 0.05])),
+        ):
+            self.assertTrue(track_and_servo._needs_approach_transit(scene, "green"))
+            self.assertTrue(track_and_servo._needs_approach_transit(scene, "red"))
+            self.assertFalse(track_and_servo._needs_approach_transit(scene, "blue"))
+            centers["blue_block"] = np.array([0.22, -0.28, 0.035])
+            self.assertFalse(track_and_servo._needs_approach_transit(scene, "green"))
+
     def test_surface_top_rejects_high_depth_outlier(self):
         points = np.array(
             [
@@ -278,22 +411,22 @@ class StackingPerceptionTests(unittest.TestCase):
     def test_text_stack_instruction_dispatches_to_stack_workflow(self):
         scene, perception_instance, servo, commands = object(), object(), object(), object()
         messages = []
-        relations = [
-            stacking_llm.StackingRelation(support="red", moving="blue")
-        ]
+        from pseudo_vla.task_plan import Destination, PickPlaceAction, TaskPlan
+
+        plan = TaskPlan(
+            intent="pick_place",
+            actions=(
+                PickPlaceAction("blue", Destination("on", "red")),
+            ),
+        )
         with (
             patch(
-                "pseudo_vla.stacking_llm.interpret_user_prompt",
-                return_value=stacking_llm.UserPrompt(
-                    intent="stack_blocks",
-                    stacking_relations=relations,
-                ),
+                "pseudo_vla.task_llm.interpret_task_prompt",
+                return_value=plan,
             ),
-            patch.object(
-                track_and_servo,
-                "_run_requested_stack_relations",
-                return_value=True,
-            ) as run_stack,
+            patch.object(track_and_servo, "_task_scene_state", return_value={}),
+            patch("pseudo_vla.task_llm.choose_task_event", side_effect=lambda event, *_args: event),
+            patch.object(track_and_servo, "_run_stack_phase", return_value=True) as run_stack,
             patch.object(track_and_servo, "_move_to_prompt") as move,
         ):
             result = track_and_servo._dispatch_user_prompt(
@@ -309,16 +442,93 @@ class StackingPerceptionTests(unittest.TestCase):
             )
 
         self.assertIsNone(result)
-        self.assertEqual(run_stack.call_args.args[3], relations)
-        self.assertIn("interpreted requested placements: blue on red", messages)
-        self.assertIn("prompted stack complete; object prompts are available", messages)
+        self.assertEqual(run_stack.call_args.args[3], "red")
+        self.assertEqual(run_stack.call_args.args[4], "blue")
+        self.assertIn("validated plan: move blue on red", messages)
+        self.assertIn("task plan complete", messages)
         move.assert_not_called()
 
-    def test_text_object_instruction_uses_llm_query_for_grounding(self):
-        parsed = stacking_llm.UserPrompt(intent="find_object", query="small green cube")
+    def test_relative_and_unstack_plans_execute_in_order(self):
+        from pseudo_vla.task_plan import Destination, PickPlaceAction, TaskPlan
+
+        scene, perception_instance, servo, commands = object(), object(), object(), object()
+        messages = []
+        plan = TaskPlan(
+            intent="pick_place",
+            actions=(
+                PickPlaceAction("blue", Destination("table")),
+                PickPlaceAction("green", Destination("left_of", "red")),
+            ),
+        )
         with (
-            patch("pseudo_vla.stacking_llm.interpret_user_prompt", return_value=parsed),
-            patch.object(track_and_servo, "_move_to_prompt", return_value="quit") as move,
+            patch("pseudo_vla.task_llm.interpret_task_prompt", return_value=plan),
+            patch.object(track_and_servo, "_task_scene_state", return_value={}),
+            patch("pseudo_vla.task_llm.choose_task_event", side_effect=lambda event, *_args: event),
+            patch.object(track_and_servo, "_table_slot_is_clear", return_value=True),
+            patch.object(track_and_servo, "_relative_slot_is_clear", return_value=True),
+            patch.object(track_and_servo, "_run_stack_phase", return_value=True) as run_phase,
+        ):
+            result = track_and_servo._dispatch_user_prompt(
+                scene,
+                perception_instance,
+                servo,
+                "unstack the tower and put green left of red",
+                commands,
+                600,
+                messages.append,
+                messages.append,
+                None,
+            )
+
+        self.assertIsNone(result)
+        destinations = [call.args[11] for call in run_phase.call_args_list]
+        self.assertEqual(
+            [(item.kind, item.target, call.args[4]) for item, call in zip(destinations, run_phase.call_args_list)],
+            [("table", None, "blue"), ("left_of", "red", "green")],
+        )
+        self.assertIn("validated plan: move blue table then move green left_of red", messages)
+
+    def test_occupied_relative_destination_does_not_move(self):
+        from pseudo_vla.task_plan import Destination, PickPlaceAction, TaskPlan
+
+        messages = []
+        plan = TaskPlan(
+            intent="pick_place",
+            actions=(PickPlaceAction("blue", Destination("left_of", "red")),),
+        )
+        with (
+            patch("pseudo_vla.task_llm.interpret_task_prompt", return_value=plan),
+            patch.object(track_and_servo, "_task_scene_state", return_value={}),
+            patch.object(track_and_servo, "_relative_slot_is_clear", return_value=False),
+            patch.object(track_and_servo, "_run_stack_phase") as run_phase,
+            patch("pseudo_vla.task_llm.choose_task_event") as choose,
+        ):
+            result = track_and_servo._dispatch_user_prompt(
+                object(),
+                object(),
+                object(),
+                "put blue to the left of red",
+                object(),
+                600,
+                messages.append,
+                messages.append,
+                None,
+            )
+
+        self.assertIsNone(result)
+        run_phase.assert_not_called()
+        choose.assert_not_called()
+        self.assertTrue(any("occupied" in message for message in messages))
+
+    def test_text_object_instruction_uses_llm_query_for_grounding(self):
+        from pseudo_vla.task_plan import TaskPlan
+
+        parsed = TaskPlan(intent="find", query="small green cube")
+        with (
+            patch("pseudo_vla.task_llm.interpret_task_prompt", return_value=parsed),
+            patch.object(track_and_servo, "_task_scene_state", return_value={}),
+            patch("pseudo_vla.task_llm.choose_task_event", return_value="find"),
+            patch.object(track_and_servo, "_find_object", return_value=True) as find,
         ):
             result = track_and_servo._dispatch_user_prompt(
                 object(),
@@ -332,8 +542,8 @@ class StackingPerceptionTests(unittest.TestCase):
                 None,
             )
 
-        self.assertEqual(result, "quit")
-        self.assertEqual(move.call_args.kwargs["grounding_prompt"], "small green cube")
+        self.assertIsNone(result)
+        self.assertEqual(find.call_args.args[3], "small green cube")
 
     def test_numeric_instruction_skips_llm_interpreter(self):
         with (

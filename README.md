@@ -8,50 +8,46 @@ This was brought up on an RTX 3080 Laptop (16 GB) with Python 3.12 and Torch 2.6
 
 ## Project status
 
-- The interactive controller supports natural-language object searches and
-  natural-language stacking requests through local Llama (`llama3.2:3b`).
-- Object requests are converted into visual queries before OWL-ViT grounding.
-  Stack requests are parsed into explicit support/moving pairs, so
-  `stack blue on top of red` requests only that placement. A multi-placement
-  request runs only its explicitly requested pairs, in support-first order.
-- d3 (`d3:4b`) is used for safe-boundary task-event decisions during stacking.
-  The existing controller owns perception, motion planning, collision handling,
-  grasping, and execution; model output is not sent to robot joints.
-- `--stack-prompt` remains a separate full-stack option: it requires all three
-  colors and takes their order bottom-to-top.
-- Automated tests and local Llama parsing have been checked. Live Isaac Sim
-  grasp, contact, and stacking behavior has not yet been validated end-to-end.
+- Interactive natural-language instructions pass through local Llama
+  (`llama3.2:3b`) and are parsed into a validated find request or an ordered
+  pick-and-place plan.
+- In the current scene, plans can stack blocks, unstack the tower onto clear
+  table positions, and place a block left or right of another block. The plan
+  validator rejects invalid relations and destinations absent from the scene
+  before robot motion.
+- d3 (`d3:4b`) selects whether each validated task stage proceeds or stops.
+  The controller and cuRobo retain responsibility for collision-aware motion,
+  grasping, placement, and physical safety; model output is never sent to joints.
+- The scene still contains only red, green, and blue cubes on a table. Box and
+  shelf destinations are represented in the task vocabulary but are rejected
+  until those objects, collision geometry, and placement behavior are added.
+- Automated tests pass. Live Isaac Sim grasp, contact, unstacking, and relative
+  placement have not yet been validated end-to-end.
 
 ## Pipeline
 
 ```mermaid
 flowchart TD
-    U[User input] --> R{Input type}
-    R -->|home, stack, quit| C[Controller command handler]
-    R -->|pixel or box coordinates| S[SAM 2 prompt]
-    R -->|free-text request| L[Llama structured task interpretation]
-
-    L --> I{Interpreted intent}
-    I -->|Find object| O[OWL-ViT visual grounding]
-    O --> S
-    I -->|Stack blocks| P[Validate explicit support/moving pairs]
-    P --> D[d3 safe-boundary event decision]
-    D --> T[CoTracker and environment RGB-D]
-
-    S --> T
-    T --> A[Estimate object pose and approach target]
-    A --> W[Wrist RGB-D grasp alignment]
-    W --> M[Controller and cuRobo collision-aware planning]
-    M --> F[Franka motion and gripper action]
-    F --> V[Observe result and update task state]
-    V -->|Another requested pair| D
-    V -->|Object prompt or task complete| C
+    U[User instruction] --> C{Control or task?}
+    C -->|home / quit| R[Controller command handler]
+    C -->|Natural language| L[Llama parses structured intent and actions]
+    L --> V[Python validates objects, destinations, and action order]
+    V -->|Invalid / unavailable destination| E[Report error; do not move]
+    V -->|Valid plan| D[d3 authorizes find and plan stages]
+    D --> F[Find: OWL-ViT, SAM 2, CoTracker, RGB-D]
+    F --> A[Approach: tracked pose and wrist RGB-D]
+    A --> G[Grasp and lift: controller and cuRobo]
+    G --> P[Place: table, on, left_of, or right_of]
+    P --> D
+    G -->|Motion or grasp failure| E
+    D -->|Stop / model failure| E
+    P -->|Plan complete| R
 ```
 
-Llama interprets user language; OWL-ViT, SAM 2, CoTracker, and RGB-D provide
-visual localization and tracking. d3 can select only from the allowed task
-events, while the controller and cuRobo retain responsibility for physical
-execution and safety checks.
+Llama proposes a structured plan; Python validates it against the current scene;
+d3 selects among bounded task events. OWL-ViT, SAM 2, CoTracker, and RGB-D
+localize objects. The controller and cuRobo execute motion and enforce physical
+safety checks.
 
 ## What is in the scene
 
@@ -72,6 +68,9 @@ cuRobo treats the table and all three blocks as cuboid obstacles, including the 
 | `pseudo_vla/cli.py` | CLI options, model parsing, and Isaac Sim lifecycle |
 | `pseudo_vla/controller.py` | Interactive task loop and robot-specific execution |
 | `pseudo_vla/stacking_workflow.py` | d3-driven stack state machine; delegates each physical pair to the controller |
+| `pseudo_vla/task_plan.py` | Typed pick-and-place plan and pre-motion validation |
+| `pseudo_vla/task_llm.py` | Generic task interpretation and d3 task-event decisions |
+| `pseudo_vla/task_workflow.py` | Ordered model-orchestrated task execution |
 | `pseudo_vla/motion.py` | Pose execution, homing, tracker updates, and camera-view updates |
 | `pseudo_vla/scene.py` | Room, Franka, colored blocks, and both cameras |
 | `pseudo_vla/blocks.py` | Shared block colors, dimensions, and scene specifications |
@@ -144,38 +143,48 @@ export OMNI_KIT_ACCEPT_EULA=YES
 python scripts/track_and_servo.py
 ```
 
-The first Kit launch is slow. Later launches are much faster. When the prompt appears:
+The first Kit launch is slow. Later launches are much faster. At `Instruction>`, enter a natural-language request:
 
-- Type a description, such as `red block`, `green block`, or `blue block`. Local Llama interprets the request, then OWL-ViT finds a box and SAM 2 segments it. You can give one placement, such as `stack blue on top of red`, or a sequence such as `stack blue on top of green then red on top of that`. Only explicitly requested placements run; a single pair does not continue to the remaining cube. Multiple placements in one instruction are ordered bottom-up and d3 authorizes each motion stage.
-- Type two numbers for a pixel on the environment image, or four numbers for a box (`x1 y1 x2 y2`).
-- Type `home` to plan back to the pose the hand had at startup.
-- Type `stack` to stack the blue cube on red. The controller tracks both cubes with one CoTracker instance and uses the red cube's tracked 3D points to place blue.
-- After blue is placed, type `continue`, `green`, or `green cube` to place green on blue. This pause lets you check the first placement before the second.
-- Launch with `--stack-prompt "stack green, then red, then blue"` to run a full three-block stack from a bottom-to-top color order. Llama parses before simulator startup, and d3 authorizes motion stages without inter-placement pauses.
-- Type `quit` to close Kit.
+- `find the green block` locates and segments the requested object without moving the arm.
+- `stack blue on red` moves only blue onto red.
+- `unstack the tower` moves top blocks to clear table slots in top-down order, leaving the table-supported base in place.
+- `put blue to the left of red` or `put green to the right of blue` places blocks beside another block.
+- Type `home` to return the hand to its startup pose, or `quit` to close Kit.
+- Numeric point and box prompts (`x y` or `x1 y1 x2 y2`) remain available for direct visual targeting.
+- `--instruction "stack blue on red"` submits a task immediately after startup. `--target` remains a deprecated alias.
+- `--stack-prompt "stack green, then red, then blue"` is retained as a legacy full-stack launch option.
 
-For text-object requests, interactive stack instructions, and `--stack-prompt`, Ollama must be running locally with `llama3.2:3b` available; `d3:4b` is also required to orchestrate stacks. Llama interprets free-text requests as either a visual object query or explicit support/moving block pairs. d3 uses Ollama's typed `/v1/systemone` choice API to authorize pairwise motion stages at safe boundaries. A model/API failure will not fall through to direct visual grounding. Numeric point and box prompts and interactive commands such as `home`, bare `stack`, and `quit` do not go through Llama. `OLLAMA_HOST` can override the default `http://localhost:11434` server address.
+Free-text instructions require local Ollama with `llama3.2:3b` and `d3:4b`.
+Llama returns a typed find request or explicit ordered actions; Python validates
+the plan against scene objects and destinations before any motion. d3 uses the
+typed `/v1/systemone` choice API at task-stage boundaries. Model/API failures
+stop the workflow; they do not fall through to direct visual grounding.
+`OLLAMA_HOST` can override the default `http://localhost:11434` server address.
 
-The model prompts and structured-output schemas are in `config/llama_task.json`, `config/llama_stacking.json`, and `config/d3_stacking.json`. Prompt text and event-choice wording can be adjusted there without changing the Ollama request or stacking-control code; supported block colors and relation validation remain enforced in Python.
+Task prompts and structured-output schemas are in `config/llama_task_plan.json`
+and `config/d3_task.json`. The older stack-only launch path uses
+`config/llama_stacking.json` and `config/d3_stacking.json`. Python validation
+remains authoritative for supported objects and destinations.
 
-A move approaches the selected block, lowers the open fingers around its center, closes the gripper, and lifts it to 20 cm above the block. It holds the block while waiting and opens only when the next non-quit command arrives. The target block is omitted from cuRobo collision checks only during intentional contact; the table and other blocks remain obstacles.
+Planned pick-and-place actions approach a selected block, use wrist RGB-D to refine alignment, close the gripper, lift it, move to the validated destination, and release it. Direct numeric pixel/box prompts retain the legacy behavior of approaching and grasping without a destination. The source block is omitted from cuRobo collision checks only during intentional contact; the table and other blocks remain obstacles.
 
-The stacking workflow seeds each cube's SAM mask at its projected image location and uses CoTracker points unprojected through the environment camera's depth to approach. At the hover pose, it segments the cube in the wrist-camera RGB image and uses wrist depth to refine the hover and grasp positions; it will not close the gripper if wrist RGB-D cannot localize the cube. It uses tracked support points for placement. After blue is picked, it drops blue's points and tracks red for placement. After blue is placed, it drops red's points and tracks blue. It pauses for an explicit `continue` command before tracking green alone through pickup; after pickup it drops green's points, tracks blue, and places green on the tracked top surface. Projected positions only seed SAM; the environment and wrist depth images provide 3D approach/grasp measurements. The moved block's collision geometry is refreshed from its simulated position after each phase.
+Each pick-and-place action seeds SAM at the projected image location of the block to move, and also the reference block when the destination is on, left of, or right of that block. CoTracker points unprojected through the environment camera's depth drive the approach. At the hover pose, wrist RGB-D refines the hover and grasp positions; the gripper stays open if wrist RGB-D cannot localize the cube. Stacking on another block drops the moving block's points after the grasp and uses the tracked support surface for placement. Table, left, and right placements use the validated geometric destination: a block's clear home slot, or a pose beside the reference block. The robot faces +Y, so left is world -X and right is world +X. Projected positions only seed SAM; the environment and wrist depth images provide 3D approach and grasp measurements. The moved block's collision geometry is refreshed from its simulated position after each phase.
 
 Useful flags:
 
 ```bash
-python scripts/track_and_servo.py --target "red block"       # first prompt, then stay open
-python scripts/track_and_servo.py --stack-prompt "stack green, then red, then blue" # model-orchestrated stack
+python scripts/track_and_servo.py --instruction "stack blue on red" # general task prompt
+python scripts/track_and_servo.py --target "red block"        # deprecated --instruction alias
+python scripts/track_and_servo.py --stack-prompt "stack green, then red, then blue" # legacy full-stack mode
 python scripts/track_and_servo.py --headless                  # no Isaac windows
 python scripts/track_and_servo.py --max-steps 600             # steps allowed for one move
 ```
 
-Run the prompt-driven workflow in the project's Conda environment:
+Run a general task in the project's Conda environment:
 
 ```bash
 OMNI_KIT_ACCEPT_EULA=YES conda run -n ps_vla python scripts/track_and_servo.py \
-  --stack-prompt "stack green, then red, then blue"
+  --instruction "put blue to the left of red"
 ```
 
 Logs for each step go to `outputs/run.log`. The first segmented frame is saved to `outputs/frame0_overlay.png`.
@@ -189,10 +198,11 @@ Logs for each step go to `outputs/run.log`. The first segmented frame is saved t
 - Tracked points identify the selected block, then the scene block bounds define a centered 10 cm hover pose with the hand pointing down.
 - The arm replans when the 3D goal moves. All blocks, including the current target, plus the table, are collision cuboids during approach. Only the selected block is temporarily omitted for intentional finger contact and lifting.
 - After approach, the gripper closes around the selected block and attempts a 20 cm lift. It keeps holding the block until another command arrives, then opens before handling that command. The controller checks whether the block followed the gripper.
-- A free-text object request passes through Llama before OWL-ViT grounding. Free-text stacking requests are interpreted as explicit support/moving pairs; only the pairs named by the user are sent to the pairwise stacking routine. Numeric points/boxes and control commands bypass Llama.
-- The bare `stack` command places blue on red, pauses for confirmation, then can place green on blue. This legacy command is separate from Llama-interpreted free-text stack requests.
+- Free-text instructions pass through Llama as a general find request or an ordered list of pick-and-place actions. The current action contract supports table, on, left_of, and right_of destinations for known blocks. Numeric points/boxes and control commands bypass Llama.
+- Table placements use the moved block's designated initial table slot and are rejected before motion when that slot is occupied. `left_of` and `right_of` currently mean negative and positive scene/world X, with a small collision clearance.
+- Box/shelf targets are recognized as future destination concepts but rejected before motion because those objects are not present in the current scene.
 - `--stack-prompt` requires red, green, and blue and interprets the requested bottom-to-top order before simulator startup. It runs all requested placements without inter-placement pauses.
-- d3 uses the typed `/v1/systemone` choice API at safe stage boundaries. Invalid, unavailable, or stop decisions halt the workflow; d3 does not directly command robot joints.
-- Green pickup first routes to a higher transit waypoint, then descends to the 10 cm hover pose so the initial route clears nearby stacked blocks.
-- Automated validation: `conda run -n ps_vla python -m unittest discover -s tests -v` passes all 37 tests. The suite mocks Llama/d3 API responses and covers prompt interpretation, relation validation, event stop/failure handling, and perception/stacking helpers. Local Llama has been checked against single- and multi-placement examples.
-- Not yet verified: end-to-end grasp, contact, placement, and task completion in a live Isaac Sim session. Passing unit tests and a local Llama parse do not establish physical execution success.
+- d3 uses the typed `/v1/systemone` choice API to authorize find, plan, approach, grasp, and place boundaries. Invalid, unavailable, or stop decisions halt the workflow; d3 does not directly command robot joints.
+- Pickup beside a taller nearby block first routes to a higher transit waypoint, then descends to the 10 cm hover pose so the approach clears that block. A block that is already the local high point approaches its hover pose directly.
+- Automated validation: `conda run -n ps_vla python -m unittest discover -s tests -v` passes 57 tests. The suite covers generic task-plan validation, d3 stops, unstack order, relative placement, stack compatibility, and perception helpers.
+- Not yet verified: end-to-end grasp, contact, table unstacking, relative placement, and task completion in a live Isaac Sim session. Passing unit tests do not establish physical execution success.

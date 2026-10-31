@@ -11,13 +11,18 @@ from pseudo_vla.scene import launch
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Find, stack, or servo to colored blocks with the environment camera."
+        description="Interpret and execute pick-and-place instructions in the Isaac Sim scene."
     )
     command_group = parser.add_mutually_exclusive_group()
     command_group.add_argument(
+        "--instruction",
+        type=str,
+        help="Natural-language pick-and-place instruction to execute after startup",
+    )
+    command_group.add_argument(
         "--target",
         type=str,
-        help="First text prompt for SAM, before the prompt",
+        help="Deprecated alias for --instruction",
     )
     command_group.add_argument(
         "--stack-prompt",

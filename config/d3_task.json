@@ -1,0 +1,9 @@
+{
+  "model": "d3:4b",
+  "task": "validated_pick_and_place",
+  "question_id": "next_event",
+  "question_type": "choice",
+  "instructions": "Choose only the offered event. Continue only when the validated plan and last completed event make it safe to do so. Select stop if the expected event cannot safely proceed.",
+  "authorize": "Authorize the {event} stage for action {action_index}: move {object} to {destination}.",
+  "stop": "Stop at this safe task boundary without executing the next stage."
+}
