@@ -97,6 +97,38 @@ def base_to_world_quat(quat_base: np.ndarray, base_quat: np.ndarray) -> np.ndarr
     return q / np.linalg.norm(q)
 
 
+# Wrist retreat along the approach. Anything shorter drops the tilted hand into the
+# counter cuboid, and cuRobo rejects the plan. Extra closeness is a horizontal slide.
+HANDLE_PINCH_REACH = 0.10
+HANDLE_PINCH_SLIDE = 0.02
+HANDLE_PINCH_INSET = 0.008
+# A horizontal pinch at the lower handle puts the wrist inside the counter cuboid.
+# Fifteen degrees lifts the wrist clear while the pads stay nearly parallel to the bar.
+SIDE_GRASP_TILT_DEG = 15.0
+SIDE_GRASP_CLEARANCE = 0.06
+
+
+def handle_pinch_target(
+    points: np.ndarray,
+    object_center: np.ndarray | None,
+    inset: float = HANDLE_PINCH_INSET,
+    surface_z: float | None = None,
+) -> np.ndarray:
+    """Move a handle sample inward, and up off the counter so the wrist can reach it."""
+    center = np.median(np.asarray(points, dtype=np.float64).reshape(-1, 3), axis=0)
+    if object_center is not None:
+        radial = center[:2] - np.asarray(object_center, dtype=np.float64).reshape(3)[:2]
+        length = float(np.linalg.norm(radial))
+        if length >= 1e-4:
+            shift = min(float(inset), 0.5 * length)
+            center = center.copy()
+            center[:2] -= radial / length * shift
+    if surface_z is not None:
+        center = center.copy()
+        center[2] = max(float(center[2]), float(surface_z) + SIDE_GRASP_CLEARANCE)
+    return center
+
+
 def adaptive_approach_pose(
     target_point: np.ndarray,
     quaternion_world: np.ndarray,
@@ -114,6 +146,21 @@ def adaptive_approach_pose(
     target = np.asarray(target_point, dtype=np.float64).reshape(3)
     total_offset = float(finger_reach) + float(standoff)
     return target - total_offset * z_hand
+
+
+def slide_grasp_toward_handle(
+    hand_position: np.ndarray,
+    quaternion_world: np.ndarray,
+    distance: float,
+) -> np.ndarray:
+    """Move the hand toward the handle horizontally so the wrist stays at a plannable height."""
+    horizontal = quat_to_matrix(quaternion_world)[:, 2].copy()
+    horizontal[2] = 0.0
+    length = float(np.linalg.norm(horizontal))
+    position = np.asarray(hand_position, dtype=np.float64).reshape(3)
+    if length < 1e-6 or distance == 0.0:
+        return position
+    return position + (float(distance) / length) * horizontal
 
 
 def adaptive_grasp_orientation(
@@ -167,24 +214,22 @@ def adaptive_grasp_orientation(
         u_tan = np.array([-u_rad[1], u_rad[0], 0.0], dtype=np.float64)
 
         if style == "side":
-            z_hand = -u_rad
-            y_hand = u_tan
-            x_hand = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            alpha = np.radians(SIDE_GRASP_TILT_DEG)
         else:
             alpha = np.radians(np.clip(tilt_angle_deg, 10.0, 80.0))
-            cos_a = np.cos(alpha)
-            sin_a = np.sin(alpha)
-            # Approach vector points inward (-u_rad) and downward (-Z)
-            z_hand = -cos_a * u_rad - sin_a * np.array([0.0, 0.0, 1.0], dtype=np.float64)
-            z_hand /= np.linalg.norm(z_hand)
-            # Fingers open along the horizontal tangent
-            y_hand = u_tan
+        cos_a = np.cos(alpha)
+        sin_a = np.sin(alpha)
+        # Approach points inward (-u_rad) and slightly downward so the wrist clears the counter.
+        z_hand = -cos_a * u_rad - sin_a * np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        z_hand /= np.linalg.norm(z_hand)
+        # Fingers open along the horizontal tangent, across the handle.
+        y_hand = u_tan
+        x_hand = np.cross(y_hand, z_hand)
+        x_hand /= np.linalg.norm(x_hand)
+        # Keep the wrist camera (+X) above the hand.
+        if x_hand[2] < 0:
+            y_hand = -y_hand
             x_hand = np.cross(y_hand, z_hand)
-            x_hand /= np.linalg.norm(x_hand)
-            # Ensure wrist camera (+X) stays on top, facing down at target
-            if x_hand[2] < 0:
-                y_hand = -y_hand
-                x_hand = np.cross(y_hand, z_hand)
 
         rot_matrix = np.stack([x_hand, y_hand, z_hand], axis=1)
         return matrix_to_quat_wxyz(rot_matrix)

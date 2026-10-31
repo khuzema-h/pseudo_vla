@@ -7,6 +7,8 @@ from pseudo_vla.geometry import (
     adaptive_grasp_orientation,
     base_to_world,
     base_to_world_quat,
+    handle_pinch_target,
+    slide_grasp_toward_handle,
     matrix_to_quat_wxyz,
     quat_inverse,
     quat_multiply,
@@ -65,6 +67,51 @@ class TestAdaptiveGrasp(unittest.TestCase):
 
         # x_hand (palm normal) should have positive Z component (wrist camera looking down at handle)
         self.assertGreater(x_hand[2], 0.5)
+
+    def test_mug_side_grasp_closes_across_the_handle(self):
+        center = np.array([-0.04, -0.28, 0.95])
+        handle_pts = np.array([
+            [-0.04, -0.23, 0.94],
+            [-0.04, -0.23, 0.95],
+            [-0.04, -0.23, 0.96],
+            [-0.04, -0.228, 0.95],
+        ])
+        quaternion = adaptive_grasp_orientation(handle_pts, object_center=center, grasp_style="side")
+        rotation = quat_to_matrix(quaternion)
+        z_hand = rotation[:, 2]
+        y_hand = rotation[:, 1]
+
+        self.assertLess(z_hand[1], -0.9)
+        self.assertAlmostEqual(z_hand[2], -np.sin(np.radians(15.0)), places=2)
+        self.assertAlmostEqual(abs(y_hand[0]), 1.0, places=2)
+        self.assertAlmostEqual(y_hand[2], 0.0, places=2)
+
+    def test_handle_pinch_target_moves_the_surface_inward(self):
+        center = np.array([-0.04, -0.28, 0.95])
+        surface = np.array([[-0.04, -0.23, 0.95]])
+
+        pinch = handle_pinch_target(surface, center, inset=0.008)
+
+        np.testing.assert_allclose(pinch, [-0.04, -0.238, 0.95], atol=1e-6)
+
+        raised = handle_pinch_target(surface, center, inset=0.008, surface_z=0.90)
+        np.testing.assert_allclose(raised, [-0.04, -0.238, 0.96], atol=1e-6)
+
+    def test_handle_slide_keeps_the_wrist_height(self):
+        center = np.array([-0.04, -0.28, 0.95])
+        handle = np.array([
+            [-0.04, -0.23, 0.95],
+            [-0.04, -0.23, 0.96],
+            [-0.04, -0.228, 0.95],
+        ])
+        quaternion = adaptive_grasp_orientation(handle, object_center=center, grasp_style="side")
+        hand = np.array([0.40, -0.22, 0.12])
+
+        slid = slide_grasp_toward_handle(hand, quaternion, 0.02)
+
+        self.assertAlmostEqual(slid[2], hand[2])
+        self.assertLess(slid[1], hand[1])
+        self.assertAlmostEqual(float(np.linalg.norm(slid[:2] - hand[:2])), 0.02, places=4)
 
     def test_elongated_object_adaptive_yaw(self):
         # Line of points along x = y (45 deg)

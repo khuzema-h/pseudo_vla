@@ -15,6 +15,7 @@ from pseudo_vla.geometry import (
     TOP_DOWN_WXYZ,
     adaptive_approach_pose,
     adaptive_grasp_orientation,
+    handle_pinch_target,
     base_to_world,
     mask_depth_points,
     pose_from_depth_points,
@@ -276,6 +277,7 @@ class Perception:
         object_center: np.ndarray | None = None,
         grasp_style: str = "auto",
         tilt_angle_deg: float = 35.0,
+        surface_z: float | None = None,
     ) -> ApproachGoal | None:
         if group is not None:
             tracks_xy, visible = self.track_group(tracks_xy, visible, group)
@@ -305,8 +307,11 @@ class Perception:
                 target_pt, quat_world, standoff=STANDOFF_Z, finger_reach=0.0
             )
         else:
+            target = center_world
+            if grasp_style == "side":
+                target = handle_pinch_target(points, object_center, surface_z=surface_z)
             goal_world = adaptive_approach_pose(
-                center_world, quat_world, standoff=STANDOFF_Z, finger_reach=0.11
+                target, quat_world, standoff=STANDOFF_Z, finger_reach=0.11
             )
 
         goal_base = world_to_base(goal_world.reshape(1, 3), base_position, base_quat)[0]

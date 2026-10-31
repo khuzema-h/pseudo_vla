@@ -24,15 +24,15 @@ class KitchenSceneTests(unittest.TestCase):
         phrases = [object_phrase(spec) for spec in scene.SCENE_OBJECTS]
         self.assertEqual(phrases, ["red block", "green block", "blue block"])
 
-    def test_kitchen_catalog_lists_plates_mugs_and_utensils(self):
+    def test_kitchen_catalog_lists_the_plate_and_mug(self):
         select_scene("kitchen")
         self.assertEqual(
             [object_id(spec) for spec in scene.SCENE_OBJECTS],
-            ["plate", "small_plate", "mug", "cup", "fork", "spoon", "knife"],
+            ["plate", "mug"],
         )
         self.assertEqual(
             [object_phrase(spec) for spec in scene.SCENE_OBJECTS],
-            ["dinner plate", "small plate", "mug", "cup", "fork", "spoon", "knife"],
+            ["dinner plate", "mug"],
         )
         self.assertEqual(scene.surface_location(), "counter")
         self.assertAlmostEqual(scene.TABLE_TOP_Z, 0.90)
@@ -64,6 +64,22 @@ class KitchenSceneTests(unittest.TestCase):
 
         plate = UsdGeom.Cylinder(stage.GetPrimAtPath("/World/plate/body"))
         self.assertAlmostEqual(plate.GetRadiusAttr().Get(), 0.095)
+
+    def test_utensil_yaw_stays_on_the_place_point(self):
+        stage = Usd.Stage.CreateInMemory()
+        spec = {
+            "name": "knife",
+            "kind": "knife",
+            "xy": (0.54, -0.30),
+            "yaw": 80.0,
+            "mass": 0.06,
+        }
+        path = place_kitchen_prop(stage, spec, 0.90)
+        cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default"])
+        box = cache.ComputeWorldBound(stage.GetPrimAtPath(path)).ComputeAlignedBox()
+        center = (box.GetMin() + box.GetMax()) / 2.0
+        self.assertAlmostEqual(float(center[0]), spec["xy"][0], delta=0.12)
+        self.assertAlmostEqual(float(center[1]), spec["xy"][1], delta=0.12)
 
     def test_select_scene_restores_the_block_table(self):
         select_scene("kitchen")
@@ -105,6 +121,20 @@ class KitchenSceneTests(unittest.TestCase):
         rotate = next(op.Get() for op in ops if op.GetOpType() == UsdGeom.XformOp.TypeRotateXYZ)
         self.assertEqual([round(float(value), 3) for value in rotate], [0.0, 0.0, 90.0])
         self.assertEqual(sum(op.GetOpType() == UsdGeom.XformOp.TypeRotateZ for op in ops), 0)
+
+    def test_mug_collision_keeps_the_handle_opening(self):
+        stage = Usd.Stage.CreateInMemory()
+        mesh = UsdGeom.Mesh.Define(stage, "/World/mug/mesh")
+        authored = UsdPhysics.MeshCollisionAPI.Apply(mesh.GetPrim())
+        authored.CreateApproximationAttr("convexHull")
+
+        scene._collide_handle_mesh(mesh.GetPrim())
+
+        prim = mesh.GetPrim()
+        approximation = UsdPhysics.MeshCollisionAPI(prim).GetApproximationAttr().Get()
+        self.assertEqual(approximation, "convexDecomposition")
+        self.assertTrue(prim.GetAttribute("physxConvexDecompositionCollision:shrinkWrap").Get())
+        self.assertGreaterEqual(prim.GetAttribute("physxConvexDecompositionCollision:maxConvexHulls").Get(), 16)
 
     def test_cli_selects_the_kitchen_and_rejects_stack_prompt(self):
         with patch("sys.argv", ["track_and_servo.py", "--scene", "kitchen"]):

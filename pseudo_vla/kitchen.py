@@ -17,9 +17,8 @@ ENV_CAMERA_EYE = np.array([0.05, 0.20, 1.55], dtype=np.float64)
 ENV_CAMERA_TARGET = np.array([0.02, -0.32, 0.98], dtype=np.float64)
 SURFACE_LOCATION = "counter"
 
-# Mugs are Isaac Sim assets. Plates and utensils are built in this scene.
+# The mug is an Isaac Sim asset. The plate is built in this scene.
 MUG_ASSET = "/Isaac/Props/Mugs/SM_Mug_A2.usd"
-CUP_ASSET = "/Isaac/Props/YCB/Axis_Aligned/025_mug.usd"
 
 KITCHEN_OBJECTS = (
     {
@@ -34,17 +33,6 @@ KITCHEN_OBJECTS = (
         "mass": 0.35,
     },
     {
-        "id": "small_plate",
-        "name": "small_plate",
-        "phrase": "small plate",
-        "kind": "plate",
-        "xy": (-0.34, -0.48),
-        "radius": 0.062,
-        "height": 0.012,
-        "color": (0.76, 0.84, 0.90),
-        "mass": 0.22,
-    },
-    {
         "id": "mug",
         "name": "mug",
         "phrase": "mug",
@@ -53,42 +41,6 @@ KITCHEN_OBJECTS = (
         "yaw": -90.0,
         "asset": MUG_ASSET,
         "mass": 0.30,
-    },
-    {
-        "id": "cup",
-        "name": "cup",
-        "phrase": "cup",
-        "kind": "asset",
-        "xy": (0.18, -0.46),
-        "asset": CUP_ASSET,
-        "mass": 0.28,
-    },
-    {
-        "id": "fork",
-        "name": "fork",
-        "phrase": "fork",
-        "kind": "fork",
-        "xy": (0.36, -0.22),
-        "yaw": 90.0,
-        "mass": 0.05,
-    },
-    {
-        "id": "spoon",
-        "name": "spoon",
-        "phrase": "spoon",
-        "kind": "spoon",
-        "xy": (0.36, -0.40),
-        "yaw": 90.0,
-        "mass": 0.05,
-    },
-    {
-        "id": "knife",
-        "name": "knife",
-        "phrase": "knife",
-        "kind": "knife",
-        "xy": (0.54, -0.30),
-        "yaw": 80.0,
-        "mass": 0.06,
     },
 )
 
@@ -224,9 +176,14 @@ def _place_root(stage, path: str, spec: dict, surface_z: float) -> None:
 
     prim = stage.GetPrimAtPath(path)
     xform = UsdGeom.Xformable(prim)
-    xform.AddRotateZOp().Set(float(spec.get("yaw", 0.0)))
     xy = spec["xy"]
-    xform.AddTranslateOp().Set(Gf.Vec3d(float(xy[0]), float(xy[1]), float(surface_z) + 0.002))
+    translate = xform.AddTranslateOp()
+    translate.Set(Gf.Vec3d(float(xy[0]), float(xy[1]), float(surface_z) + 0.002))
+    rotate = xform.AddRotateZOp()
+    rotate.Set(float(spec.get("yaw", 0.0)))
+    # Translate must stay outside the yaw. The other order spins the place point
+    # around the origin and drops the knife across the mug approach.
+    xform.SetXformOpOrder([translate, rotate])
     body = UsdPhysics.RigidBodyAPI.Apply(prim)
     body.CreateRigidBodyEnabledAttr(True)
     mass = UsdPhysics.MassAPI.Apply(prim)

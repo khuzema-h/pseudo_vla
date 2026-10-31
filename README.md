@@ -188,7 +188,7 @@ Run a general task in the project's Conda environment:
 OMNI_KIT_ACCEPT_EULA=YES conda run -n ps_vla python scripts/track_and_servo.py \
   --instruction "put blue to the left of red"
 
-The default scene is the simple room with red, green, and blue blocks. `--scene kitchen` builds a separate counter kitchen. Its manipulable objects are a dinner plate, a small plate, two mugs from the Isaac Sim asset pack, and a fork, spoon, and knife. The work surface location is `counter`. `--stack-prompt` stays on the block scene.
+The default scene is the simple room with red, green, and blue blocks. `--scene kitchen` builds a separate counter kitchen. Its manipulable objects are a dinner plate and a mug. The work surface location is `counter`. `--stack-prompt` stays on the block scene.
 ```
 
 Each simulator run saves its terminal output to a new file under `outputs/logs/`, and `outputs/logs/latest.log` points at the newest one. Step details that are not printed are appended to that same file. The first segmented frame is saved to `outputs/frame0_overlay.png`.

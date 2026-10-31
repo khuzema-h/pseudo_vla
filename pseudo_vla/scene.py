@@ -49,12 +49,12 @@ CLOSED_FINGERS = {
     "panda_finger_joint2": 0.0,
 }
 ARM_JOINT_NAMES = list(HOME_ARM)
-# A few millimeters of position error at the default drive is too weak to lift
-# the mug. 120 N crushed the handle and pushed it out. 2.5 kN/m asks for about
-# 25 N at a 1 cm gap, and the cap stops the fingers from slamming harder.
-FINGER_GRIP_STIFFNESS = 5000.0
+# The fingers close onto a thin handle. Past about 40 N the pads cam the mug
+# out instead of holding it, so a harder drive makes the slip worse. 2.5 kN/m
+# asks for 25 N at a 1 cm gap, and the cap stops a wider gap from slamming harder.
+FINGER_GRIP_STIFFNESS = 2500.0
 FINGER_GRIP_DAMPING = 40.0
-FINGER_GRIP_EFFORT = 10.0
+FINGER_GRIP_EFFORT = 25.0
 
 _BLOCKS_TABLE_MIN = TABLE_MIN.copy()
 _BLOCKS_TABLE_MAX = TABLE_MAX.copy()
@@ -546,12 +546,72 @@ def _place_asset(spec: dict, assets_root: str) -> str:
             continue
         if not descendant.HasAPI(UsdPhysics.CollisionAPI):
             UsdPhysics.CollisionAPI.Apply(descendant)
-        if descendant.IsA(UsdGeom.Mesh) and not descendant.HasAPI(UsdPhysics.MeshCollisionAPI):
-            mesh = UsdPhysics.MeshCollisionAPI.Apply(descendant)
-            mesh.CreateApproximationAttr("convexHull")
+        if descendant.IsA(UsdGeom.Mesh):
+            _collide_handle_mesh(descendant)
+            _bind_grasp_friction(descendant)
     _seat_on_surface(path, spec)
     _record_prop_bounds(spec)
     return path
+
+
+def _collide_handle_mesh(prim) -> None:
+    """Decompose a mug mesh so the handle stays a separate piece with an opening.
+
+    A single convex hull fills that opening. The fingers then press a rounded
+    shell, and a harder close pushes the mug out of the grip.
+    """
+    from pxr import Sdf, UsdPhysics
+
+    mesh = UsdPhysics.MeshCollisionAPI.Apply(prim)
+    mesh.CreateApproximationAttr().Set("convexDecomposition")
+    try:
+        from pxr import PhysxSchema
+
+        decomp = PhysxSchema.PhysxConvexDecompositionCollisionAPI.Apply(prim)
+        decomp.CreateMaxConvexHullsAttr(32)
+        decomp.CreateHullVertexLimitAttr(64)
+        decomp.CreateVoxelResolutionAttr(500000)
+        decomp.CreateErrorPercentageAttr(1.0)
+        decomp.CreateMinThicknessAttr(0.001)
+        decomp.CreateShrinkWrapAttr(True)
+    except ImportError:
+        for name, type_name, value in (
+            ("physxConvexDecompositionCollision:maxConvexHulls", Sdf.ValueTypeNames.Int, 32),
+            ("physxConvexDecompositionCollision:hullVertexLimit", Sdf.ValueTypeNames.Int, 64),
+            ("physxConvexDecompositionCollision:voxelResolution", Sdf.ValueTypeNames.Int, 500000),
+            ("physxConvexDecompositionCollision:errorPercentage", Sdf.ValueTypeNames.Float, 1.0),
+            ("physxConvexDecompositionCollision:minThickness", Sdf.ValueTypeNames.Float, 0.001),
+            ("physxConvexDecompositionCollision:shrinkWrap", Sdf.ValueTypeNames.Bool, True),
+        ):
+            prim.CreateAttribute(name, type_name).Set(value)
+
+
+def _grasp_friction_material(stage):
+    from pxr import UsdPhysics, UsdShade
+
+    path = "/World/Physics/grasp_friction"
+    prim = stage.GetPrimAtPath(path)
+    if prim.IsValid():
+        return UsdShade.Material(prim)
+    material = UsdShade.Material.Define(stage, path)
+    physics = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
+    physics.CreateStaticFrictionAttr(1.2)
+    physics.CreateDynamicFrictionAttr(1.0)
+    physics.CreateRestitutionAttr(0.0)
+    return material
+
+
+def _bind_grasp_friction(prim) -> None:
+    from pxr import UsdShade
+
+    material = _grasp_friction_material(prim.GetStage())
+    UsdShade.MaterialBindingAPI.Apply(prim).Bind(material, materialPurpose="physics")
+
+
+def _bind_finger_friction(stage) -> None:
+    for prim in stage.Traverse():
+        if prim.GetName() in {"panda_leftfinger", "panda_rightfinger"}:
+            _bind_grasp_friction(prim)
 
 
 def _seat_on_surface(path: str, spec: dict) -> None:
@@ -641,6 +701,7 @@ def build_scene(app, scene_name: str = "blocks") -> FrankaScene:
 
     stage = omni.usd.get_context().get_stage()
     hand_path = _find_prim_path(stage, "panda_hand")
+    _bind_finger_friction(stage)
     base_path = _find_prim_path(stage, "panda_link0")
     wrist_camera_path = hand_path + "/wrist_cam"
     wrist = Camera(wrist_camera_path)

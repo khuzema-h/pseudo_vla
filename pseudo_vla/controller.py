@@ -39,6 +39,18 @@ from pseudo_vla.stacking_workflow import (
 from pseudo_vla.task_workflow import run_task_plan
 
 GRIPPER_FINGER_REACH = 0.07
+
+
+def _grasp_contact_target(center, object_center, grasp_style: str, surface_z: float) -> tuple[np.ndarray, float]:
+    """Aim a side pinch at the handle bar, above the counter. Other grasps keep the block reach."""
+    from pseudo_vla.geometry import HANDLE_PINCH_REACH, handle_pinch_target
+
+    point = np.asarray(center, dtype=np.float64).reshape(3)
+    if grasp_style != "side":
+        return point, GRIPPER_FINGER_REACH
+    return handle_pinch_target(point, object_center, surface_z=surface_z), HANDLE_PINCH_REACH
+
+
 LIFT_HEIGHT = 0.20
 STACK_TRANSIT_CLEARANCE = 0.15
 APPROACH_TRANSIT_RADIUS = 0.35
@@ -112,8 +124,7 @@ def run(app, args: argparse.Namespace) -> None:
 
         if SCENE_NAME == "kitchen":
             say(
-                'Enter a pick-and-place instruction, such as "hold mug and place it on the plate" '
-                'or "move the fork to the left of the spoon".'
+                'Enter a pick-and-place instruction, such as "hold mug and place it on the plate".'
             )
         else:
             say(
@@ -745,9 +756,11 @@ def _stack_tracked_cube(
     affordance: str | None = None,
 ) -> bool:
     from pseudo_vla.geometry import (
+        HANDLE_PINCH_SLIDE,
         adaptive_approach_pose,
         adaptive_grasp_orientation,
         base_to_world_quat,
+        slide_grasp_toward_handle,
         world_to_base_quat,
     )
     from pseudo_vla.perception import (
@@ -756,7 +769,7 @@ def _stack_tracked_cube(
         prim_world_pose,
         world_to_base,
     )
-    from pseudo_vla.scene import SCENE_OBJECTS, object_id
+    from pseudo_vla.scene import SCENE_OBJECTS, TABLE_TOP_Z, object_id
 
     specs = {object_id(spec): spec for spec in SCENE_OBJECTS}
     if destination is None:
@@ -774,6 +787,8 @@ def _stack_tracked_cube(
     hover_goal = None
     hover_surface = None
     hover_points = None
+    obj_center = None if moving_item is None else moving_item.center_world
+    grasp_style = "side" if moving_spec.get("kind") in {"asset", "mug", "cup"} or affordance == "hold" else "auto"
     transit = _needs_approach_transit(scene, moving_name)
 
     if authorize_event is not None and not authorize_event("approach"):
@@ -809,7 +824,7 @@ def _stack_tracked_cube(
                 moving_spec.get("kind") in {"asset", "mug", "cup"}
                 or affordance == "hold"
             )
-            grasp_style = "tilted" if is_tall_or_mug else "auto"
+            grasp_style = "side" if is_tall_or_mug else "auto"
             goal = perception.approach_goal(
                 tracks_xy,
                 visible,
@@ -820,6 +835,7 @@ def _stack_tracked_cube(
                 group="moving",
                 object_center=obj_center,
                 grasp_style=grasp_style,
+                surface_z=TABLE_TOP_Z,
             )
             if goal is None:
                 log(f"stack approach {moving_name}: fewer than 4 valid CoTracker depth points")
@@ -908,11 +924,14 @@ def _stack_tracked_cube(
             grasp_style=grasp_style,
         )
         grasp_quaternion = world_to_base_quat(quat_world, base_quat)
+        pinch_point, finger_reach = _grasp_contact_target(
+            moving_center, obj_center, grasp_style, TABLE_TOP_Z
+        )
         align_world = adaptive_approach_pose(
-            moving_center,
+            pinch_point,
             quat_world,
             standoff=STANDOFF_Z,
-            finger_reach=GRIPPER_FINGER_REACH,
+            finger_reach=finger_reach,
         )
         align_goal = ApproachGoal(
             position=world_to_base(align_world.reshape(1, 3), base_world, base_quat)[0],
@@ -970,12 +989,17 @@ def _stack_tracked_cube(
         grasp_quaternion = grasp_alignment.quaternion.copy()
     base_world, base_quat = prim_world_pose(scene.base_path)
     quat_world = base_to_world_quat(grasp_quaternion, base_quat)
+    pinch_point, finger_reach = _grasp_contact_target(
+        moving_center, moving_item.center_world, grasp_style, TABLE_TOP_Z
+    )
     grasp_world = adaptive_approach_pose(
-        moving_center,
+        pinch_point,
         quat_world,
         standoff=0.0,
-        finger_reach=GRIPPER_FINGER_REACH,
+        finger_reach=finger_reach,
     )
+    if grasp_style == "side":
+        grasp_world = slide_grasp_toward_handle(grasp_world, quat_world, HANDLE_PINCH_SLIDE)
     grasp_goal = ApproachGoal(
         position=world_to_base(grasp_world.reshape(1, 3), base_world, base_quat)[0],
         quaternion=grasp_quaternion,
