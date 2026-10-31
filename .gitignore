@@ -34,3 +34,4 @@ checkpoints/
 
 # Third-party clone (has its own git repo)
 segment-anything-2/
+OOAL/
