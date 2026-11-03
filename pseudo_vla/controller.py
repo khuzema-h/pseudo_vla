@@ -218,13 +218,13 @@ def _dispatch_user_prompt(
             scene, perception, servo, prompt, commands, max_steps, say, log, view
         )
 
-    from pseudo_vla.stacking_llm import StackingModelError
+    from pseudo_vla.tev1_client import Tev1Error
     from pseudo_vla.task_llm import interpret_task_prompt
 
     try:
         parsed = interpret_task_prompt(prompt, _task_scene_state(scene, perception))
-    except (StackingModelError, ValueError) as error:
-        say(f"could not interpret prompt with Llama: {error}")
+    except (Tev1Error, ValueError) as error:
+        say(f"could not interpret prompt with Tev1: {error}")
         return None
 
     if parsed.intent == "find":
@@ -289,11 +289,6 @@ def _dispatch_user_prompt(
         else:
             support_name = destination.target
 
-        def authorize_stack_stage(stage, completed=False):
-            if stage in {"lift", "verify_placement"}:
-                return True
-            return authorize_event(stage, completed)
-
         return _run_stack_phase(
             scene,
             perception,
@@ -305,7 +300,7 @@ def _dispatch_user_prompt(
             say,
             log,
             view,
-            authorize_stack_stage,
+            authorize_event,
             destination,
             prompt,
         )
@@ -611,7 +606,8 @@ def _run_stack_phase(
     destination=None,
     instruction: str = "",
 ) -> bool:
-    from pseudo_vla.affordance import grasp_region_points, match_seen_affordance
+    from pseudo_vla.affordance import choose_seen_affordance, grasp_region_points
+    from pseudo_vla.tev1_client import Tev1Error
     from pseudo_vla.task_plan import Destination
 
     if destination is None:
@@ -638,7 +634,11 @@ def _run_stack_phase(
         prompts[group_name] = (None, item.box)
 
     perception.segment_groups(rgb, prompts)
-    affordance = match_seen_affordance(instruction)
+    try:
+        affordance = choose_seen_affordance(instruction, moving_name)
+    except Tev1Error as error:
+        say(f"Tev1 could not select a grasp affordance safely: {error}")
+        return False
     if affordance is None:
         say(f"no seen affordance in the instruction; tracking the full SAM mask of {moving_name}")
     else:
@@ -1469,7 +1469,7 @@ def _prompt_to_sam(
         try:
             grounding_prompt = normalize_object_prompt(prompt)
         except (StackingModelError, ValueError) as error:
-            say(f"could not interpret object prompt with Llama: {error}")
+            say(f"could not interpret object prompt with Tev1: {error}")
             return None, None
     say(f'grounding "{prompt}" as "{grounding_prompt}"')
     found = perception.ground(rgb, grounding_prompt)

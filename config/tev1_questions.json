@@ -1,0 +1,67 @@
+{
+  "model": "tev1:4b",
+  "max_questions": 64,
+  "questions": {
+    "task_intent": {
+      "type": "choice",
+      "instructions": "Which supported high-level task best matches the user's instruction? Choose only find or pick_place when one clearly applies."
+    },
+    "find_target": {
+      "type": "choice",
+      "instructions": "Which listed scene object is the user asking to find? Select none if no listed object matches."
+    },
+    "plan_more": {
+      "type": "noul",
+      "instructions": "Does the user's instruction require another explicitly requested pick-and-place action after the listed actions? Do not add unrequested moves.",
+      "criteria": {
+        "true": "At least one requested action remains.",
+        "false": "The requested plan is complete or no action is supported."
+      }
+    },
+    "moving_object": {
+      "type": "choice",
+      "instructions": "Which available listed object should the next action move? Preserve the user's requested order. When clearing supported objects, move outermost objects before their supports, using only the observed supported_by relations. Select none if the instruction does not identify an available object."
+    },
+    "destination_kind": {
+      "type": "choice",
+      "instructions": "Which listed destination relationship does the user request? Use only the offered destination kinds and do not infer a different destination."
+    },
+    "destination_target": {
+      "type": "choice",
+      "instructions": "Which listed scene object, location, or container is the requested destination?"
+    },
+    "task_event": {
+      "type": "choice",
+      "instructions": "Choose the expected event only if the validated plan and last completed event support proceeding. Otherwise stop at this safe boundary."
+    },
+    "stack_base": {
+      "type": "choice",
+      "instructions": "Which listed block belongs at the bottom of the explicitly requested bottom-to-top stack order?"
+    },
+    "stack_next": {
+      "type": "choice",
+      "instructions": "Which remaining listed block belongs next in the requested bottom-to-top stack order? Do not change the direction or add a block."
+    },
+    "stack_event": {
+      "type": "choice",
+      "instructions": "Which listed stack event is the next legal event, or should the workflow stop?"
+    },
+    "affordance_family": {
+      "type": "choice",
+      "instructions": "Which affordance family best describes the interaction requested for the target object? Select none if none applies."
+    },
+    "affordance_label": {
+      "type": "choice",
+      "instructions": "Which listed seen OOAL affordance best matches the requested interaction and grasp region? Treat grasping as hold or pick_up when one of those is listed. Select none if none applies."
+    },
+    "affordance_fit": {
+      "type": "score",
+      "instructions": "How well does the selected seen affordance match the user's requested interaction with the target object?",
+      "criteria": [
+        "No meaningful match between the affordance and the requested interaction.",
+        "A plausible but uncertain match.",
+        "A clear match for the requested interaction and grasp region."
+      ]
+    }
+  }
+}

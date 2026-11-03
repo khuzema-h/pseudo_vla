@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     command_group.add_argument(
         "--stack-prompt",
         type=str,
-        help="Natural-language bottom-to-top cube order, parsed by local Llama before Isaac Sim starts",
+        help="Natural-language bottom-to-top cube order, parsed by local Tev1 before Isaac Sim starts",
     )
     parser.add_argument(
         "--scene",

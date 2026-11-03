@@ -1,8 +1,8 @@
-"""OOAL affordance heatmaps for grasp regions.
+"""Tev1-selected OOAL affordance heatmaps for grasp regions.
 
-A user instruction is matched against the seen affordance names in
-OOAL/data/agd20k_ego.py. The matched class, such as hold, supplies the
-heatmap whose hot pixels seed CoTracker on the object SAM is grasping.
+Tev1 selects a seen affordance from OOAL/data/agd20k_ego.py. The selected class
+supplies the heatmap whose hot pixels seed CoTracker on the object SAM is
+grasping.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from pseudo_vla.tev1_client import Tev1Error, ask_choice, ask_score
 
 ROOT = Path(__file__).resolve().parents[1]
 OOAL_ROOT = ROOT / "OOAL"
@@ -26,6 +27,56 @@ _CHECKPOINT_CANDIDATES = (
 _model = None
 _seen_names: tuple[str, ...] | None = None
 _status = "OOAL is not loaded"
+_AFFORDANCE_FAMILIES = {
+    "body_force_and_motion": (
+        "beat",
+        "boxing",
+        "catch",
+        "hit",
+        "jump",
+        "kick",
+        "swing",
+        "throw",
+    ),
+    "object_manipulation": (
+        "carry",
+        "cut",
+        "cut_with",
+        "drag",
+        "hold",
+        "lift",
+        "open",
+        "pack",
+        "peel",
+        "pick_up",
+        "pour",
+        "push",
+        "stick",
+        "stir",
+        "wash",
+    ),
+    "tool_support_and_use": (
+        "brush_with",
+        "drink_with",
+        "eat",
+        "lie_on",
+        "look_out",
+        "ride",
+        "sip",
+        "sit_on",
+        "take_photo",
+        "talk_on",
+        "text_on",
+        "type_on",
+        "write",
+    ),
+}
+_AFFORDANCE_HINTS = {
+    "carry": "carrying an object while moving it",
+    "hold": "holding or grasping an object",
+    "lift": "raising an object",
+    "pick_up": "grasping and lifting an object from a surface",
+}
 
 
 def affordance_status() -> str:
@@ -44,7 +95,7 @@ def seen_affordance_names() -> tuple[str, ...]:
 
 
 def match_seen_affordance(prompt: str) -> str | None:
-    """Return the seen affordance named by the instruction.
+    """Return a seen affordance explicitly named by the instruction.
 
     Longer names win when they start at the same word, so "cut with" matches
     cut_with rather than cut. The earliest match in the instruction wins.
@@ -65,6 +116,78 @@ def match_seen_affordance(prompt: str) -> str | None:
             best_at = found.start()
             best_length = len(phrase)
     return best_name
+
+
+def choose_seen_affordance(prompt: str, object_id: str) -> str | None:
+    """Use bounded Tev1 choices to select a supported OOAL grasp affordance."""
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None
+    names = seen_affordance_names()
+    grouped_names = {name for family in _AFFORDANCE_FAMILIES.values() for name in family}
+    if set(names) != grouped_names:
+        raise Tev1Error("Tev1 affordance groups must exactly match OOAL's seen classes")
+
+    state: dict[str, object] = {
+        "instruction": prompt.strip(),
+        "target_object": object_id,
+    }
+    explicitly_named = match_seen_affordance(prompt)
+    if explicitly_named is not None:
+        state.update(phase="select_explicit_affordance", candidates=[explicitly_named])
+        selected = ask_choice(
+            "affordance_label",
+            state,
+            {
+                explicitly_named: (
+                    _affordance_description(explicitly_named, explicit=True)
+                ),
+                "none": "The named affordance does not apply to the requested interaction.",
+            },
+        )
+        return _validate_affordance_fit(selected, state)
+
+    state.update(
+        phase="select_affordance_family",
+        supported_affordance_families=list(_AFFORDANCE_FAMILIES),
+    )
+    family_criteria = {
+        family: f"Choose a seen affordance in this family: {', '.join(affordances)}."
+        for family, affordances in _AFFORDANCE_FAMILIES.items()
+    }
+    family_criteria["none"] = "No OOAL seen affordance matches the requested interaction."
+    family = ask_choice("affordance_family", state, family_criteria)
+    if family == "none":
+        return None
+
+    state.update(
+        phase="select_affordance_label",
+        selected_family=family,
+    )
+    affordance_criteria = {
+        name: _affordance_description(name)
+        for name in _AFFORDANCE_FAMILIES[family]
+    }
+    affordance_criteria["none"] = "No affordance in this family matches the request."
+    affordance = ask_choice("affordance_label", state, affordance_criteria)
+    return _validate_affordance_fit(affordance, state)
+
+
+def _validate_affordance_fit(affordance: str, state: dict[str, object]) -> str | None:
+    if affordance == "none":
+        return None
+
+    state.update(phase="validate_affordance_fit", selected_affordance=affordance)
+    if ask_score("affordance_fit", state) < 1.0:
+        return None
+    return affordance
+
+
+def _affordance_description(name: str, *, explicit: bool = False) -> str:
+    label = name.replace("_", " ")
+    hint = _AFFORDANCE_HINTS.get(name, f"the {label} interaction")
+    if explicit:
+        return f"The instruction explicitly names {hint} for this object."
+    return f"Use the {label} affordance, meaning {hint}, for this target."
 
 
 def peak_pixel(heatmap: np.ndarray, width: int, height: int) -> tuple[float, float]:

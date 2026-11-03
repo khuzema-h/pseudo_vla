@@ -8,22 +8,27 @@ This was brought up on an RTX 3080 Laptop (16 GB) with Python 3.12 and Torch 2.6
 
 ## Project status
 
-- Interactive natural-language instructions pass through local Llama
-  (`llama3.2:3b`) and are parsed into a validated find request or an ordered
-  pick-and-place plan.
+- Interactive natural-language instructions pass through local Tev1
+  (`tev1:4b`) using a bounded, adaptive question bank in
+  `config/tev1_questions.json`. The workflow asks only questions relevant to
+  the current decision and refreshes state after each completed stage.
 - Plans use a scene-neutral pick-and-place contract: `find`, or ordered moves
   with destination kind `at`, `on`, `left_of`, `right_of`, or `inside`. Object,
   location, and container ids come from the current scene state. In this scene
   those are the red, green, and blue blocks and the `table` location. A plan
   that names anything else is rejected before robot motion.
-- d3 (`d3:4b`) selects whether each validated task stage proceeds or stops.
-  The controller and cuRobo retain responsibility for collision-aware motion,
-  grasping, placement, and physical safety; model output is never sent to joints.
+- Tev1 selects supported tasks, scene-listed objects and destinations, OOAL
+  grasp affordances, and whether the next validated task stage proceeds or
+  stops. Python validates every selection. The controller and cuRobo retain
+  responsibility for collision-aware motion and physical safety; model output
+  is never executed as a function name or sent to joints.
 - The scene still contains only red, green, and blue cubes on a table. There
   are no containers, so an `inside` destination is rejected until a container,
   its collision geometry, and a placement behavior are added.
-- Automated tests pass. Live Isaac Sim grasp, contact, unstacking, and relative
-  placement have not yet been validated end-to-end.
+- Tev1-focused and task-workflow tests pass. The full suite still has a
+  relative-placement expectation failure in `tests/test_stacking.py`; live Isaac
+  Sim grasp, contact, unstacking, and relative placement have not been validated
+  end-to-end.
 
 ## Pipeline
 
@@ -31,10 +36,10 @@ This was brought up on an RTX 3080 Laptop (16 GB) with Python 3.12 and Torch 2.6
 flowchart TD
     U[User instruction] --> C{Control or task?}
     C -->|home / quit| R[Controller command handler]
-    C -->|Natural language| L[Llama parses structured intent and actions]
-    L --> V[Python validates objects, destinations, and action order]
+    C -->|Natural language| T[Tev1 selects bounded task and object options]
+    T --> V[Python validates objects, destinations, and action order]
     V -->|Invalid / unavailable destination| E[Report error; do not move]
-    V -->|Valid plan| D[d3 authorizes find and plan stages]
+    V -->|Valid plan| D[Tev1 authorizes find and plan stages]
     D --> F[Find: OWL-ViT, SAM 2, CoTracker, RGB-D]
     F --> A[Approach: tracked pose and wrist RGB-D]
     A --> G[Grasp and lift: controller and cuRobo]
@@ -45,10 +50,11 @@ flowchart TD
     P -->|Plan complete| R
 ```
 
-Llama proposes a structured plan; Python validates it against the current scene;
-d3 selects among bounded task events. OWL-ViT, SAM 2, CoTracker, and RGB-D
-localize objects. The controller and cuRobo execute motion and enforce physical
-safety checks.
+Tev1 selects among question-bank options; Python constructs and validates the
+plan against the current scene. Tev1 receives updated state before each
+callback-informed stage decision. OWL-ViT, SAM 2, CoTracker, OOAL, and RGB-D
+localize objects and grasp regions. The controller and cuRobo execute motion
+and enforce physical safety checks.
 
 ## What is in the scene
 
@@ -68,10 +74,12 @@ cuRobo treats the table and all three blocks as cuboid obstacles, including the 
 | `scripts/track_and_servo.py` | Thin executable entry point |
 | `pseudo_vla/cli.py` | CLI options, model parsing, and Isaac Sim lifecycle |
 | `pseudo_vla/controller.py` | Interactive task loop and robot-specific execution |
-| `pseudo_vla/stacking_workflow.py` | d3-driven stack state machine; delegates each physical pair to the controller |
+| `pseudo_vla/stacking_workflow.py` | Tev1-driven stack state machine; delegates each physical pair to the controller |
 | `pseudo_vla/task_plan.py` | Typed pick-and-place plan and pre-motion validation |
-| `pseudo_vla/task_llm.py` | Generic task interpretation and d3 task-event decisions |
+| `pseudo_vla/task_llm.py` | Tev1 task routing and task-event decisions |
 | `pseudo_vla/task_workflow.py` | Ordered model-orchestrated task execution |
+| `pseudo_vla/tev1_client.py` | Validated `/v1/systemone` client and typed decision responses |
+| `pseudo_vla/affordance.py` | Tev1 affordance selection and OOAL grasp-region sampling |
 | `pseudo_vla/motion.py` | Pose execution, homing, tracker updates, and camera-view updates |
 | `pseudo_vla/scene.py` | Room, Franka, colored blocks, and both cameras |
 | `pseudo_vla/blocks.py` | Shared block colors, dimensions, and scene specifications |
@@ -80,7 +88,7 @@ cuRobo treats the table and all three blocks as cuboid obstacles, including the 
 | `pseudo_vla/geometry.py` | Camera projection, depth unprojection, and robot-frame geometry |
 | `pseudo_vla/servo.py` | cuRobo planner and joint playback |
 | `pseudo_vla/view.py` | Wrist viewport and the SAM + CoTracker window |
-| `config/` | Llama and d3 model prompts, response schema, and event-choice templates |
+| `config/tev1_questions.json` | Adaptive choice, boolean, and score question bank (up to 64 questions) |
 | `checkpoints/` | SAM 2 weights (not committed) |
 | `segment-anything-2/` | Local SAM 2 clone, installed editable (not committed) |
 
@@ -148,28 +156,41 @@ The first Kit launch is slow. Later launches are much faster. At `Instruction>`,
 
 - `find the green block` locates and segments the requested object without moving the arm.
 - `stack blue on red` moves only blue onto red.
-- `unstack the tower` asks for supported blocks to be moved to the `table` location, outermost first. Llama sees `supported_by` from the scene; Python accepts the returned ids only when they are in that scene.
+- `unstack the tower` asks for supported blocks to be moved to the `table` location, outermost first. Tev1 receives observed `supported_by` relationships; Python accepts selected ids only when they are in the current scene.
 - `put blue to the left of red` or `put green to the right of blue` places blocks beside another block.
 - Type `home` to return the hand to its startup pose, or `quit` to close Kit.
 - Numeric point and box prompts (`x y` or `x1 y1 x2 y2`) remain available for direct visual targeting.
 - `--instruction "stack blue on red"` submits a task immediately after startup. `--target` remains a deprecated alias.
 - `--stack-prompt "stack green, then red, then blue"` is retained as a legacy full-stack launch option.
 
-Free-text instructions require local Ollama with `llama3.2:3b` and `d3:4b`.
-Llama returns a typed find request or explicit ordered actions; Python validates
-the plan against scene objects and destinations before any motion. d3 uses the
-typed `/v1/systemone` choice API at task-stage boundaries. Model/API failures
-stop the workflow; they do not fall through to direct visual grounding.
+Free-text instructions require local Ollama with Tev1. Install Ollama 0.35 or
+later and pull the 4B decision model before starting:
+
+```bash
+ollama pull tev1:4b
+```
+
+Tev1 uses the typed `/v1/systemone` API. Its `choice` questions select among
+bounded task and scene options, `noul` answers provide boolean probabilities,
+and `score` questions use ordered rubric levels. The JSON question bank
+contains fewer than 64 question definitions; each API call asks only the
+question(s) relevant to its current state. Task and stage decisions are made
+again after controller/perception callbacks update that state. Errors, invalid
+answers, unsupported tasks, and Tev1 stop decisions halt safely; there is no
+fallback to another model or direct visual grounding after a model error.
+Choice and score questions stay within Tev1's trained 2–24 option range.
 `OLLAMA_HOST` can override the default `http://localhost:11434` server address.
 
-Task prompts and structured-output schemas are in `config/llama_task_plan.json`
-and `config/d3_task.json`. The older stack-only launch path uses
-`config/llama_stacking.json` and `config/d3_stacking.json`. Python validation
-remains authoritative for supported objects and destinations.
+`config/tev1_questions.json` defines the supported question types and
+instructions. Dynamic choice criteria are built from the current scene
+catalog; Python validation remains authoritative for supported objects,
+locations, containers, and action order. AGD20K_EGO labels are grasp-affordance
+options only, not standalone robot tasks. The loaded OOAL seen-class model
+limits which affordances can be selected.
 
 Planned pick-and-place actions approach a selected block, use wrist RGB-D to refine alignment, close the gripper, lift it, move to the validated destination, and release it. Direct numeric pixel/box prompts retain the legacy behavior of approaching and grasping without a destination. The source block is omitted from cuRobo collision checks only during intentional contact; the table and other blocks remain obstacles.
 
-Each pick-and-place action finds the blocks in the environment camera. A color named by the object id is boxed from the image; other phrases use OWL-ViT. SAM is seeded on those boxes. Scene state always lists the scene's object ids, and includes a position only after a depth measurement. Object positions used for collision boxes, clearance, and placement come from unprojecting that camera's depth. A place is reported only when a new depth measurement shows the object at the destination. CoTracker points unprojected through the same depth drive the approach. A seen OOAL affordance named in the instruction, such as hold in "hold mug and place it on the plate", supplies the heatmap. SAM still segments the grasped object and the placement target. CoTracker points for the grasped object are sampled on the hot part of that heatmap inside the SAM mask. Those 3D points are projected into the wrist camera, and wrist depth at the projected pixels aligns the gripper before it descends onto the same points. The placement target keeps points across its full mask. Wrist segmentation refines the hover only when the instruction names no seen affordance. The gripper stays open if that wrist view cannot localize the object. Stacking on another block drops the moving block's points after the grasp and uses the tracked support surface for placement. Table, left, and right placements use the validated geometric destination: a block's clear home slot, or a pose beside the reference block. The robot faces +Y, so left is world -X and right is world +X. Projected positions only seed SAM; the environment and wrist depth images provide 3D approach and grasp measurements. The moved block's collision geometry is refreshed from a new environment-camera depth measurement after each phase.
+Each pick-and-place action finds the blocks in the environment camera. A color named by the object id is boxed from the image; other phrases use OWL-ViT. SAM is seeded on those boxes. Scene state always lists the scene's object ids, and includes a position only after a depth measurement. Object positions used for collision boxes, clearance, and placement come from unprojecting that camera's depth. A place is reported only when a new depth measurement shows the object at the destination. CoTracker points unprojected through the same depth drive the approach. Tev1 selects a supported OOAL seen affordance, such as `hold`, from the question bank; a no-match decision keeps the full SAM mask, while an invalid/model-error decision stops before motion. SAM still segments the grasped object and the placement target. CoTracker points for the grasped object are sampled on the hot part of that heatmap inside the SAM mask. Those 3D points are projected into the wrist camera, and wrist depth at the projected pixels aligns the gripper before it descends onto the same points. The placement target keeps points across its full mask. Wrist segmentation refines the hover when no seen affordance is selected. The gripper stays open if that wrist view cannot localize the object. Stacking on another block drops the moving block's points after the grasp and uses the tracked support surface for placement. Table, left, and right placements use the validated geometric destination: a block's clear home slot, or a pose beside the reference block. The robot faces +Y, so left is world -X and right is world +X. Projected positions only seed SAM; the environment and wrist depth images provide 3D approach and grasp measurements. The moved block's collision geometry is refreshed from a new environment-camera depth measurement after each phase.
 
 Useful flags:
 
@@ -202,11 +223,11 @@ Each simulator run saves its terminal output to a new file under `outputs/logs/`
 - Tracked points identify the selected block, then the scene block bounds define a centered 10 cm hover pose with the hand pointing down.
 - The arm replans when the 3D goal moves. All blocks, including the current target, plus the table, are collision cuboids during approach. Only the selected block is temporarily omitted for intentional finger contact and lifting.
 - After approach, the gripper closes around the selected block and attempts a 20 cm lift. It keeps holding the block until another command arrives, then opens before handling that command. The controller checks whether the block followed the gripper.
-- Free-text instructions pass through Llama as a find request or an ordered list of pick-and-place actions. Destination kinds are `at`, `on`, `left_of`, `right_of`, and `inside`. The scene state supplies the legal object, location, and container ids. Numeric points/boxes and control commands bypass Llama.
+- Free-text instructions pass through Tev1 as a find request or an ordered list of pick-and-place actions. Destination kinds are `at`, `on`, `left_of`, `right_of`, and `inside`. The scene state supplies the legal object, location, and container ids. Numeric points/boxes and control commands bypass Tev1.
 - In this scene, `at table` uses the moved block's designated initial table slot and is rejected before motion when that slot is occupied. `left_of` and `right_of` mean negative and positive scene/world X, with a small collision clearance.
 - `inside` is rejected before motion because this scene lists no containers.
 - `--stack-prompt` requires red, green, and blue and interprets the requested bottom-to-top order before simulator startup. It runs all requested placements without inter-placement pauses.
-- d3 uses the typed `/v1/systemone` choice API to authorize find, plan, approach, grasp, and place boundaries. Invalid, unavailable, or stop decisions halt the workflow; d3 does not directly command robot joints.
+- Tev1 uses `/v1/systemone` to authorize find, plan, approach, grasp, lift, place, and verification boundaries with refreshed callback state. Invalid, unavailable, or stop decisions halt the workflow; Tev1 does not directly command robot joints.
 - Pickup beside a taller nearby block first routes to a higher transit waypoint, then descends to the 10 cm hover pose so the approach clears that block. A block that is already the local high point approaches its hover pose directly.
-- Automated validation: `conda run -n ps_vla python -m unittest discover -s tests -v` passes 81 tests. The suite covers scene-neutral task-plan validation, d3 stops, relative placement, stack compatibility, and perception helpers.
+- Automated validation: `conda run -n ps_vla python -m unittest discover -s tests -v` covers Tev1 request/response validation, adaptive task decisions, callback-informed progression, affordance selection, scene-neutral task-plan validation, relative placement, stack compatibility, and perception helpers. Tests mock Ollama; they do not require a live model.
 - Not yet verified: end-to-end grasp, contact, table unstacking, relative placement, and task completion in a live Isaac Sim session. Passing unit tests do not establish physical execution success.

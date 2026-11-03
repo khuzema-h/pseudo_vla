@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -36,6 +37,75 @@ class SeenAffordanceTests(unittest.TestCase):
 
     def test_unrelated_instruction_matches_nothing(self):
         self.assertIsNone(match_seen_affordance("move the fork to the left of the spoon"))
+
+    def test_tev1_selects_only_a_supported_seen_affordance(self):
+        from pseudo_vla import affordance
+
+        supported = tuple(
+            name
+            for family in affordance._AFFORDANCE_FAMILIES.values()
+            for name in family
+        )
+        with (
+            patch("pseudo_vla.affordance.seen_affordance_names", return_value=supported),
+            patch(
+                "pseudo_vla.affordance.ask_choice",
+                return_value="hold",
+            ) as choose,
+            patch("pseudo_vla.affordance.ask_score", return_value=2.0) as score,
+        ):
+            result = affordance.choose_seen_affordance("hold the mug", "mug")
+
+        self.assertEqual(result, "hold")
+        self.assertEqual(choose.call_count, 1)
+        self.assertEqual(set(choose.call_args.args[2]), {"hold", "none"})
+        self.assertEqual(score.call_args.args[0], "affordance_fit")
+        self.assertEqual(score.call_args.args[1]["selected_affordance"], "hold")
+
+    def test_tev1_affordance_can_reject_no_match_or_low_fit(self):
+        from pseudo_vla import affordance
+
+        supported = tuple(
+            name
+            for family in affordance._AFFORDANCE_FAMILIES.values()
+            for name in family
+        )
+        with (
+            patch("pseudo_vla.affordance.seen_affordance_names", return_value=supported),
+            patch("pseudo_vla.affordance.ask_choice", return_value="none"),
+            patch("pseudo_vla.affordance.ask_score") as score,
+        ):
+            self.assertIsNone(affordance.choose_seen_affordance("move it", "mug"))
+        score.assert_not_called()
+
+        with (
+            patch("pseudo_vla.affordance.seen_affordance_names", return_value=supported),
+            patch(
+                "pseudo_vla.affordance.ask_choice",
+                return_value="hold",
+            ),
+            patch("pseudo_vla.affordance.ask_score", return_value=0.8),
+        ):
+            self.assertIsNone(affordance.choose_seen_affordance("hold the mug", "mug"))
+
+    def test_tev1_maps_grasping_to_the_seen_hold_affordance(self):
+        from pseudo_vla import affordance
+
+        supported = tuple(
+            name
+            for family in affordance._AFFORDANCE_FAMILIES.values()
+            for name in family
+        )
+        with (
+            patch("pseudo_vla.affordance.seen_affordance_names", return_value=supported),
+            patch(
+                "pseudo_vla.affordance.ask_choice",
+                side_effect=["object_manipulation", "hold"],
+            ),
+            patch("pseudo_vla.affordance.ask_score", return_value=2.0),
+        ):
+            result = affordance.choose_seen_affordance("grasp the mug by its handle", "mug")
+        self.assertEqual(result, "hold")
 
     def test_hot_heatmap_inside_the_mask_seeds_the_grasp_region(self):
         mask = np.zeros((40, 40), dtype=bool)

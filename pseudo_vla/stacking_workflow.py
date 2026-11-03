@@ -16,7 +16,8 @@ def run_prompted_stack_sequence(
     run_stack_phase,
 ) -> bool:
     """Orchestrate legal stack events while delegating physical work to the controller."""
-    from pseudo_vla.stacking_llm import StackingModelError, choose_stack_event
+    from pseudo_vla.stacking_llm import choose_stack_event
+    from pseudo_vla.tev1_client import Tev1Error
 
     placed: list[str] = []
     current_support = None
@@ -30,17 +31,17 @@ def run_prompted_stack_sequence(
                 current_support,
                 last_event_result,
             )
-        except (StackingModelError, ValueError) as error:
-            say(f"stack orchestration failed safely: {error}")
+        except (Tev1Error, ValueError) as error:
+            say(f"Tev1 stack orchestration failed safely: {error}")
             return False
 
-        say(f"d3 selected stack event: {event}")
+        say(f"Tev1 selected stack event: {event}")
         if event == "stop":
-            say("d3 stopped the stack workflow at a safe boundary")
+            say("Tev1 stopped the stack workflow at a safe boundary")
             return False
         if event == "establish_base":
             if placed:
-                say("d3 selected establish_base after the base was already set")
+                say("Tev1 selected establish_base after the base was already set")
                 return False
             current_support = goal_order[0]
             placed.append(current_support)
@@ -54,7 +55,7 @@ def run_prompted_stack_sequence(
             continue
         if event == "stack_next":
             if not placed or len(placed) >= len(goal_order) or current_support != placed[-1]:
-                say("d3 selected stack_next in an invalid task state")
+                say("Tev1 selected stack_next in an invalid task state")
                 return False
             moving_name = goal_order[len(placed)]
 
@@ -77,12 +78,12 @@ def run_prompted_stack_sequence(
                         expected_event=stage,
                         current_pair={"support": current_support, "moving": moving_name},
                     )
-                except (StackingModelError, ValueError) as error:
-                    say(f"d3 could not authorize {stage} safely: {error}")
+                except (Tev1Error, ValueError) as error:
+                    say(f"Tev1 could not authorize {stage} safely: {error}")
                     return False
-                say(f"d3 selected stack event: {selected}")
+                say(f"Tev1 selected stack event: {selected}")
                 if selected != stage:
-                    say(f"d3 stopped the stack workflow before {stage}")
+                    say(f"Tev1 stopped the stack workflow before {stage}")
                     return False
                 return True
 
@@ -119,10 +120,10 @@ def run_prompted_stack_sequence(
             continue
         if event == "finish":
             if placed != goal_order:
-                say("d3 selected finish before the requested stack was complete")
+                say("Tev1 selected finish before the requested stack was complete")
                 return False
             return True
-        say(f"d3 selected unsupported stack event {event!r}")
+        say(f"Tev1 selected unsupported stack event {event!r}")
         return False
 
 
@@ -139,7 +140,8 @@ def run_requested_stack_relations(
     run_stack_phase,
 ) -> bool:
     """Execute only the explicitly requested support/moving pairs, bottom-up."""
-    from pseudo_vla.stacking_llm import StackingModelError, choose_stack_action
+    from pseudo_vla.stacking_llm import choose_stack_action
+    from pseudo_vla.tev1_client import Tev1Error
 
     last_event_result: dict[str, object] | None = None
     for relation in relations:
@@ -163,12 +165,12 @@ def run_requested_stack_relations(
                     stage,
                     last_event_result,
                 )
-            except (StackingModelError, ValueError) as error:
-                say(f"d3 could not authorize {stage} safely: {error}")
+            except (Tev1Error, ValueError) as error:
+                say(f"Tev1 could not authorize {stage} safely: {error}")
                 return False
-            say(f"d3 selected stack event: {selected}")
+            say(f"Tev1 selected stack event: {selected}")
             if selected != stage:
-                say(f"d3 stopped the stack workflow before {stage}")
+                say(f"Tev1 stopped the stack workflow before {stage}")
                 return False
             return True
 

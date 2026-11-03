@@ -1,4 +1,9 @@
-# Natural-Language, Model-Orchestrated Block Stacking
+# Historical Plan: Natural-Language, Model-Orchestrated Block Stacking
+
+> This document records the original Llama/d3 implementation plan and is kept
+> for history. The current Tev1 task routing and runtime behavior are documented
+> in [the project README](../README.md) and configured in
+> [config/tev1_questions.json](../config/tev1_questions.json).
 
 ## Goal
 

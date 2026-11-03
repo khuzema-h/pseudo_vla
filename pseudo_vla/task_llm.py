@@ -1,86 +1,185 @@
-"""Natural-language task plans and bounded d3 event choices."""
+"""Tev1 task routing and callback-informed task-event decisions."""
 
 from __future__ import annotations
 
-import json
-
-from pseudo_vla.stacking_llm import (
-    StackingModelError,
-    _load_prompt_config,
-    _post_json,
-    _prompt_config_string,
-)
 from pseudo_vla.task_plan import (
+    DESTINATION_KINDS,
     PickPlaceAction,
     TaskPlan,
     validate_task_plan,
 )
+from pseudo_vla.tev1_client import Tev1Error, ask_boolean, ask_choice
 
-TASK_EVENTS = ("find", "plan", "approach", "grasp", "place")
+TASK_EVENTS = ("find", "plan", "approach", "grasp", "lift", "place", "verify_placement")
+MAX_PLAN_ACTIONS = 6
+_MAX_CHOICE_OPTIONS = 24
 
 
 def interpret_task_prompt(user_prompt: str, scene_state: dict[str, object] | None = None) -> TaskPlan:
+    """Route a natural-language request through choices bounded by the current scene."""
     if not isinstance(user_prompt, str) or not user_prompt.strip():
         raise ValueError("A non-empty prompt is required")
-    config = _load_prompt_config("llama_task_plan.json")
-    schema = config.get("response_schema")
-    if not isinstance(schema, dict):
-        raise StackingModelError("Llama task-plan config must contain an object response_schema")
-    state_text = json.dumps(scene_state or {}, sort_keys=True)
-    user_content = (
-        f"Instruction: {user_prompt.strip()}\n"
-        f"Current scene state (ground truth): {state_text}\n"
-        "Use only these current-scene objects and relationships; do not guess hidden or occluded state. "
-        "Placing one object on another uses destination kind on and that object's id. "
-        "Use kind at only when the target is a location id from the scene state."
-    )
-    response = _post_json(
-        "/api/chat",
+    instruction = user_prompt.strip()
+    state = scene_state or {}
+    objects, locations, containers = _scene_catalog(state)
+    if not objects:
+        raise Tev1Error("Cannot route a task without objects in the current scene")
+
+    decision_state = {
+        "instruction": instruction,
+        "scene": state,
+        "phase": "select_task_intent",
+    }
+    intent = ask_choice(
+        "task_intent",
+        decision_state,
         {
-            "model": _prompt_config_string(config, "model", "Llama"),
-            "messages": [
-                {"role": "system", "content": _prompt_config_string(config, "system_prompt", "Llama")},
-                {"role": "user", "content": user_content},
-            ],
-            "format": schema,
-            "stream": False,
-            "options": {"temperature": 0},
+            "find": "Find, locate, or identify one object without moving it.",
+            "pick_place": "Move one or more listed objects to listed destinations.",
+            "unsupported": "The requested operation is not supported by the available handlers.",
         },
     )
-    message = response.get("message")
-    content = message.get("content") if isinstance(message, dict) else None
-    if not isinstance(content, str):
-        raise StackingModelError("Llama response is missing message.content")
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError as error:
-        raise StackingModelError(f"Llama returned invalid task plan JSON: {content!r}") from error
-    if not isinstance(parsed, dict) or set(parsed) != {"intent", "query", "actions"}:
-        raise StackingModelError("Llama task plan must contain only intent, query, and actions")
-    objects, locations, containers = _scene_catalog(scene_state)
+    if intent == "unsupported":
+        raise Tev1Error("Tev1 classified the instruction as an unsupported task")
+    if intent == "find":
+        candidates = _option_criteria(objects, "Find the scene object")
+        candidates["none"] = "No listed scene object matches the requested object."
+        target = ask_choice(
+            "find_target",
+            {**decision_state, "phase": "select_find_target"},
+            candidates,
+        )
+        if target == "none":
+            raise Tev1Error("Tev1 could not match the find request to a scene object")
+        try:
+            return validate_task_plan(
+                "find",
+                target,
+                [],
+                available_objects=objects,
+                available_locations=locations,
+                available_containers=containers,
+            )
+        except ValueError as error:
+            raise Tev1Error(f"Could not validate Tev1 find decision: {error}") from error
+
+    actions: list[dict[str, object]] = []
+    for index in range(MAX_PLAN_ACTIONS + 1):
+        state_for_step = {
+            **decision_state,
+            "phase": "select_next_action",
+            "actions_so_far": actions,
+            "action_index": index,
+        }
+        more_actions = ask_boolean("plan_more", state_for_step)
+        if not more_actions:
+            break
+        if index == MAX_PLAN_ACTIONS:
+            raise Tev1Error(
+                f"Tev1 requested more than the maximum of {MAX_PLAN_ACTIONS} actions"
+            )
+
+        moved = {
+            action["object"]
+            for action in actions
+            if isinstance(action.get("object"), str)
+        }
+        available_to_move = tuple(object_id for object_id in objects if object_id not in moved)
+        if not available_to_move:
+            raise Tev1Error("Tev1 requested another action but no unmoved objects remain")
+        moving_criteria = _option_criteria(available_to_move, "Move this scene object")
+        moving_criteria["none"] = "No available object matches the requested action."
+        moving = ask_choice(
+            "moving_object",
+            {**state_for_step, "phase": "select_moving_object"},
+            moving_criteria,
+        )
+        if moving == "none":
+            raise Tev1Error("Tev1 could not match an action to an available object")
+
+        target_catalogs = {
+            "at": locations,
+            "inside": containers,
+            "on": tuple(object_id for object_id in objects if object_id != moving),
+            "left_of": tuple(object_id for object_id in objects if object_id != moving),
+            "right_of": tuple(object_id for object_id in objects if object_id != moving),
+        }
+        kind_criteria = {
+            kind: f"Use destination kind {kind}."
+            for kind in DESTINATION_KINDS
+            if target_catalogs[kind]
+        }
+        if not kind_criteria:
+            raise Tev1Error("No supported destination is available for this scene object")
+        kind_criteria["unsupported"] = "The requested destination is not represented in this scene."
+        destination_kind = ask_choice(
+            "destination_kind",
+            {**state_for_step, "phase": "select_destination_kind", "moving_object": moving},
+            kind_criteria,
+        )
+        if destination_kind == "unsupported":
+            raise Tev1Error("Tev1 selected a destination that is not supported in this scene")
+
+        targets = target_catalogs[destination_kind]
+        if len(targets) == 1:
+            target = targets[0]
+        else:
+            target_criteria = _option_criteria(targets, "Use this listed destination")
+            target_criteria["none"] = "No listed destination matches the user's request."
+            target = ask_choice(
+                "destination_target",
+                {
+                    **state_for_step,
+                    "phase": "select_destination_target",
+                    "moving_object": moving,
+                    "destination_kind": destination_kind,
+                },
+                target_criteria,
+            )
+            if target == "none":
+                raise Tev1Error("Tev1 could not match the destination to the current scene")
+        actions.append(
+            {
+                "object": moving,
+                "destination": {"kind": destination_kind, "target": target},
+            }
+        )
+        try:
+            validate_task_plan(
+                "pick_place",
+                "",
+                actions,
+                available_objects=objects,
+                available_locations=locations,
+                available_containers=containers,
+            )
+        except ValueError as error:
+            raise Tev1Error(f"Tev1 proposed an invalid action: {error}") from error
+
+    if not actions:
+        raise Tev1Error("Tev1 did not select any supported pick-and-place actions")
     try:
         return validate_task_plan(
-            parsed["intent"],
-            parsed["query"],
-            parsed["actions"],
+            "pick_place",
+            "",
+            actions,
             available_objects=objects,
             available_locations=locations,
             available_containers=containers,
         )
     except ValueError as error:
-        raise StackingModelError(f"Could not validate Llama task plan: {error}") from error
+        raise Tev1Error(f"Could not validate Tev1 task plan: {error}") from error
 
 
 def _scene_catalog(
-    scene_state: dict[str, object] | None,
+    scene_state: dict[str, object],
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    """Read object, location, and container ids from a scene-state payload."""
-    state = scene_state or {}
-    raw_objects = state.get("objects", state.get("movable_objects", ()))
+    """Read object, location, and container identifiers from scene state."""
+    raw_objects = scene_state.get("objects", scene_state.get("movable_objects", ()))
     return (
         _catalog_ids(raw_objects, nested_id=True),
-        _catalog_ids(state.get("locations", ())),
-        _catalog_ids(state.get("containers", ())),
+        _catalog_ids(scene_state.get("locations", ())),
+        _catalog_ids(scene_state.get("containers", ())),
     )
 
 
@@ -96,6 +195,20 @@ def _catalog_ids(values: object, *, nested_id: bool = False) -> tuple[str, ...]:
     return tuple(dict.fromkeys(identifiers))
 
 
+def _option_criteria(
+    identifiers: tuple[str, ...],
+    description: str,
+) -> dict[str, str]:
+    if len(identifiers) > _MAX_CHOICE_OPTIONS - 1:
+        raise Tev1Error(
+            f"Tev1 can compare at most {_MAX_CHOICE_OPTIONS - 1} scene candidates at once"
+        )
+    return {
+        identifier: f"{description} {identifier}."
+        for identifier in identifiers
+    }
+
+
 def choose_task_event(
     event: str,
     action: PickPlaceAction | None,
@@ -103,27 +216,24 @@ def choose_task_event(
     last_event_result: dict[str, object] | None,
     plan: TaskPlan | None = None,
 ) -> str:
+    """Ask Tev1 to authorize one expected task event at the current safe boundary."""
     if event not in TASK_EVENTS:
         raise ValueError(f"Unsupported task event {event!r}")
     if action_index < 0:
         raise ValueError("Action index must be non-negative")
-    config = _load_prompt_config("d3_task.json")
-    choices = {
-        event: _format_authorize(config, action, event, action_index),
-        "stop": _prompt_config_string(config, "stop", "d3"),
-    }
-    state = {
-        "task": _prompt_config_string(config, "task", "d3"),
-        "phase": f"authorize_{event}",
-        "action_index": action_index,
-        "action": {
+    action_state = (
+        {
             "object": action.object_id,
             "destination": {
                 "kind": action.destination.kind,
                 "target": action.destination.target,
             },
-        } if action is not None else None,
-        "validated_plan": [
+        }
+        if action is not None
+        else None
+    )
+    validated_plan = (
+        [
             {
                 "object": item.object_id,
                 "destination": {
@@ -132,63 +242,23 @@ def choose_task_event(
                 },
             }
             for item in plan.actions
-        ] if plan is not None and plan.intent == "pick_place" else [],
-        "last_event_result": last_event_result,
+        ]
+        if plan is not None and plan.intent == "pick_place"
+        else []
+    )
+    choices = {
+        event: f"Proceed with the expected {event} event for action {action_index + 1}.",
+        "stop": "Stop before the next stage; do not dispatch another action.",
     }
-    response = _post_json(
-        "/v1/systemone",
+    return ask_choice(
+        "task_event",
         {
-            "model": _prompt_config_string(config, "model", "d3"),
-            "state": state,
-            "questions": {
-                _prompt_config_string(config, "question_id", "d3"): {
-                    "type": _prompt_config_string(config, "question_type", "d3"),
-                    "instructions": _prompt_config_string(config, "instructions", "d3"),
-                    "criteria": choices,
-                }
-            },
+            "task": "validated_pick_and_place",
+            "phase": f"authorize_{event}",
+            "action_index": action_index,
+            "action": action_state,
+            "validated_plan": validated_plan,
+            "last_event_result": last_event_result,
         },
+        choices,
     )
-    answers = response.get("answers")
-    answer = (
-        answers.get(_prompt_config_string(config, "question_id", "d3"))
-        if isinstance(answers, dict)
-        else None
-    )
-    selected = answer.get("choice") if isinstance(answer, dict) else None
-    if not isinstance(selected, str) or selected not in choices:
-        raise StackingModelError(
-            f"d3 returned invalid task event {selected!r}; expected one of {tuple(choices)}"
-        )
-    return selected
-
-
-def _format_authorize(
-    config: dict[str, object],
-    action: PickPlaceAction | None,
-    event: str,
-    action_index: int,
-) -> str:
-    template = _prompt_config_string(config, "authorize", "d3")
-    if action is None:
-        try:
-            return template.format(
-                event=event,
-                action_index=action_index + 1,
-                object="requested object",
-                destination="requested destination",
-            )
-        except (KeyError, ValueError) as error:
-            raise StackingModelError(f"d3 task prompt template is invalid: {error}") from error
-    destination = action.destination.kind
-    if action.destination.target:
-        destination = f"{destination} {action.destination.target}"
-    try:
-        return template.format(
-            event=event,
-            action_index=action_index + 1,
-            object=action.object_id,
-            destination=destination,
-        )
-    except (KeyError, ValueError) as error:
-        raise StackingModelError(f"d3 task prompt template is invalid: {error}") from error

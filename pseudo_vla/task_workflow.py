@@ -7,7 +7,7 @@ from pseudo_vla.task_plan import TaskPlan
 
 def run_task_plan(plan: TaskPlan, say, run_find, run_action) -> bool:
     """Orchestrate plan-level events and delegate physical actions to the controller."""
-    from pseudo_vla.stacking_llm import StackingModelError
+    from pseudo_vla.tev1_client import Tev1Error
     from pseudo_vla.task_llm import choose_task_event
 
     last_event_result: dict[str, object] | None = None
@@ -16,12 +16,12 @@ def run_task_plan(plan: TaskPlan, say, run_find, run_action) -> bool:
         nonlocal last_event_result
         try:
             selected = choose_task_event(event, action, index, last_event_result, plan)
-        except (StackingModelError, ValueError) as error:
-            say(f"d3 could not authorize {event} safely: {error}")
+        except (Tev1Error, ValueError) as error:
+            say(f"Tev1 could not authorize {event} safely: {error}")
             return False
-        say(f"d3 selected task event: {selected}")
+        say(f"Tev1 selected task event: {selected}")
         if selected != event:
-            say(f"d3 stopped the task before {event}")
+            say(f"Tev1 stopped the task before {event}")
             return False
         return True
 
@@ -60,8 +60,15 @@ def run_task_plan(plan: TaskPlan, say, run_find, run_action) -> bool:
                 "object": action.object_id,
             }
             return False
+        if (
+            last_event_result is None
+            or last_event_result.get("event") != "verify_placement"
+            or last_event_result.get("success") is not True
+        ):
+            say("controller reported success without completing placement verification")
+            return False
         last_event_result = {
-            "event": "place",
+            **(last_event_result or {}),
             "success": True,
             "action_index": index,
             "object": action.object_id,

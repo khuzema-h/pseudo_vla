@@ -38,6 +38,14 @@ class _FakeTracker:
         self.calls.append(kwargs)
 
 
+def _complete_action_with_callbacks(*args):
+    authorize_event = args[10]
+    for stage in ("approach", "grasp", "lift", "place", "verify_placement"):
+        if not authorize_event(stage) or not authorize_event(stage, completed=True):
+            return False
+    return True
+
+
 class StackingPerceptionTests(unittest.TestCase):
     def test_grouped_segmentation_seeds_one_tracker_with_group_slices(self):
         instance = perception.Perception.__new__(perception.Perception)
@@ -540,7 +548,7 @@ class StackingPerceptionTests(unittest.TestCase):
             )
         self.assertIsNone(point)
         self.assertIsNone(box)
-        self.assertIn("could not interpret object prompt with Llama", messages[-1])
+        self.assertIn("could not interpret object prompt with Tev1", messages[-1])
         perception_instance.ground.assert_not_called()
 
     def test_text_stack_instruction_dispatches_to_stack_workflow(self):
@@ -561,7 +569,11 @@ class StackingPerceptionTests(unittest.TestCase):
             ),
             patch.object(track_and_servo, "_task_scene_state", return_value={}),
             patch("pseudo_vla.task_llm.choose_task_event", side_effect=lambda event, *_args: event),
-            patch.object(track_and_servo, "_run_stack_phase", return_value=True) as run_stack,
+            patch.object(
+                track_and_servo,
+                "_run_stack_phase",
+                side_effect=_complete_action_with_callbacks,
+            ) as run_stack,
             patch.object(track_and_servo, "_move_to_prompt") as move,
         ):
             result = track_and_servo._dispatch_user_prompt(
@@ -601,7 +613,11 @@ class StackingPerceptionTests(unittest.TestCase):
             patch("pseudo_vla.task_llm.choose_task_event", side_effect=lambda event, *_args: event),
             patch.object(track_and_servo, "_table_slot_is_clear", return_value=True),
             patch.object(track_and_servo, "_relative_slot_is_clear", return_value=True),
-            patch.object(track_and_servo, "_run_stack_phase", return_value=True) as run_phase,
+            patch.object(
+                track_and_servo,
+                "_run_stack_phase",
+                side_effect=_complete_action_with_callbacks,
+            ) as run_phase,
         ):
             result = track_and_servo._dispatch_user_prompt(
                 scene,
