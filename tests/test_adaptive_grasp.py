@@ -8,6 +8,7 @@ from pseudo_vla.geometry import (
     base_to_world,
     base_to_world_quat,
     handle_pinch_target,
+    side_grasp_placement_world,
     slide_grasp_toward_handle,
     matrix_to_quat_wxyz,
     quat_inverse,
@@ -150,6 +151,27 @@ class TestAdaptiveGrasp(unittest.TestCase):
         z_hand = R[:, 2]
         # standoff to grasp should be exactly along z_hand
         np.testing.assert_allclose(grasp - standoff, 0.10 * z_hand, atol=1e-6)
+
+    def test_side_grasp_release_keeps_the_counter_clearance(self):
+        support = np.array(
+            [
+                [-0.36, -0.26, 0.910],
+                [-0.32, -0.26, 0.916],
+                [-0.36, -0.22, 0.912],
+                [-0.32, -0.22, 0.914],
+            ]
+        )
+        hand = np.array([0.05, -0.28, 1.00])
+        center = np.array([-0.04, -0.28, 0.95])
+        preplace, place, moved, top = side_grasp_placement_world(
+            support, hand, center, surface_z=0.90, clearance=0.30
+        )
+
+        self.assertAlmostEqual(top, 0.916)
+        np.testing.assert_allclose(place, [-0.25, -0.24, 1.016])
+        np.testing.assert_allclose(preplace, [-0.25, -0.24, 1.316])
+        np.testing.assert_allclose(moved[:2], [-0.34, -0.24])
+        self.assertAlmostEqual(moved[2] - center[2], place[2] - hand[2])
 
 
 if __name__ == "__main__":

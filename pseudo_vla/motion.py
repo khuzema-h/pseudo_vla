@@ -9,6 +9,12 @@ import numpy as np
 APPROACH_TOLERANCE = 0.02
 HOME_DISTANCE = 0.02
 GRIPPER_SETTLE_STEPS = 45
+# A side-grasped mug meets the plate before a too-low goal. Stop there instead
+# of planning another descent.
+DESCENT_STALL_STEPS = 40
+DESCENT_STALL_DROP = 0.005
+DESCENT_HORIZONTAL = 0.04
+DESCENT_CONTACT_GAP = 0.05
 
 
 def poll_command(commands: queue.Queue[str]) -> str | None:
@@ -16,6 +22,27 @@ def poll_command(commands: queue.Queue[str]) -> str | None:
         return commands.get_nowait()
     except queue.Empty:
         return None
+
+
+def descent_is_supported(
+    hand: np.ndarray,
+    goal: np.ndarray,
+    stall_step: int | None,
+    stall_z: float | None,
+    step: int,
+) -> tuple[bool, int | None, float | None]:
+    """True when the hand is over a lower goal and has stopped descending."""
+    hand = np.asarray(hand, dtype=np.float64).reshape(3)
+    goal = np.asarray(goal, dtype=np.float64).reshape(3)
+    horizontal = float(np.linalg.norm(hand[:2] - goal[:2]))
+    gap = float(hand[2] - goal[2])
+    if horizontal > DESCENT_HORIZONTAL or gap <= APPROACH_TOLERANCE or gap > DESCENT_CONTACT_GAP:
+        return False, None, None
+    if stall_z is None or float(stall_z) - float(hand[2]) >= DESCENT_STALL_DROP:
+        return False, step, float(hand[2])
+    if stall_step is not None and step - stall_step >= DESCENT_STALL_STEPS:
+        return True, stall_step, stall_z
+    return False, stall_step, stall_z
 
 
 def execute_pose(
@@ -27,18 +54,32 @@ def execute_pose(
     max_steps: int,
     log,
     view,
+    release_when_supported: bool = False,
 ) -> tuple[bool, str | None]:
     servo.clear()
     servo.update_goal(goal, scene.joint_positions())
     if servo.trajectory is None:
         return False, None
 
+    stall_step = None
+    stall_z = None
     for step in range(max_steps):
         incoming = poll_command(commands)
         if incoming:
             return False, incoming
         scene.step()
-        servo.update_goal(goal, scene.joint_positions())
+        hand = servo.hand_position(scene.joint_positions())
+        if release_when_supported:
+            supported, stall_step, stall_z = descent_is_supported(
+                hand, goal.position, stall_step, stall_z, step
+            )
+            if supported:
+                log("release height is supported; not driving further down")
+                servo.clear()
+                scene.set_joint_targets(scene.joint_positions())
+                return True, None
+        else:
+            servo.update_goal(goal, scene.joint_positions())
         command = servo.command()
         if command:
             scene.set_joint_targets(command)
@@ -46,7 +87,7 @@ def execute_pose(
         update_tracker(scene, perception, rgb, depth, view)
         if float(np.linalg.norm(servo.hand_position(scene.joint_positions()) - goal.position)) <= APPROACH_TOLERANCE:
             return True, None
-        if servo.trajectory is None:
+        if servo.trajectory is None or (release_when_supported and servo.trajectory.finished):
             log(f"pose motion lost its trajectory at step {step}")
             return False, None
         if step % 60 == 0:

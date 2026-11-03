@@ -52,6 +52,11 @@ def _grasp_contact_target(center, object_center, grasp_style: str, surface_z: fl
 
 
 LIFT_HEIGHT = 0.20
+# A side grasp holds the mug by the handle, so the body hangs below the hand.
+# The block lift and the 10 cm stack hover leave that body close to the counter
+# and the plate.
+MUG_LIFT_HEIGHT = 0.40
+PLATE_HOVER_CLEARANCE = 0.30
 STACK_TRANSIT_CLEARANCE = 0.15
 APPROACH_TRANSIT_RADIUS = 0.35
 APPROACH_TRANSIT_HEIGHT = 0.02
@@ -1036,8 +1041,9 @@ def _stack_tracked_cube(
             authorize_event("grasp", completed=True)
 
         moving_top = grasp_top
+        lift_height = _lift_height(moving_spec, grasp_style)
         lift_world = grasp_world.copy()
-        lift_world[2] += LIFT_HEIGHT
+        lift_world[2] += lift_height
         base_world, base_quat = prim_world_pose(scene.base_path)
         lift_goal = ApproachGoal(
             position=world_to_base(lift_world.reshape(1, 3), base_world, base_quat)[0],
@@ -1047,7 +1053,7 @@ def _stack_tracked_cube(
         )
         if authorize_event is not None and not authorize_event("lift"):
             return False
-        say(f"lifting {moving_name}")
+        say(f"lifting {moving_name} by {lift_height:.2f} m")
         reached, pending = _execute_pose(scene, servo, lift_goal, perception, commands, max_steps, log, view)
         if pending is not None or not reached:
             if pending is not None:
@@ -1082,11 +1088,23 @@ def _stack_tracked_cube(
                     "support", tracks_xy, visible, depth, camera_params, scene.camera_path
                 )
                 if support_points.shape[0] >= 4:
-                    preplace_goal, place_goal = _stack_placement_goals(
-                        support_points,
-                        moving_dims,
-                        scene.base_path,
-                    )
+                    if grasp_style == "side":
+                        preplace_goal, place_goal = _side_placement_goals(
+                            support_points,
+                            grasp_world,
+                            moving_item.center_world,
+                            TABLE_TOP_Z,
+                            grasp_goal.quaternion,
+                            scene.base_path,
+                            clearance=_placement_clearance(support_spec),
+                        )
+                    else:
+                        preplace_goal, place_goal = _stack_placement_goals(
+                            support_points,
+                            moving_dims,
+                            scene.base_path,
+                            clearance=_placement_clearance(support_spec),
+                        )
                     servo.update_goal(preplace_goal, scene.joint_positions())
             elif destination.kind != "on":
                 if (
@@ -1138,7 +1156,15 @@ def _stack_tracked_cube(
         try:
             say(f"placing {moving_name} at {destination_label}")
             reached, pending = _execute_pose(
-                scene, servo, place_goal, perception, commands, max_steps, log, view
+                scene,
+                servo,
+                place_goal,
+                perception,
+                commands,
+                max_steps,
+                log,
+                view,
+                release_when_supported=grasp_style == "side",
             )
             if pending is not None or not reached:
                 if pending is not None:
@@ -1196,7 +1222,70 @@ def _stack_transit_goal(hover_goal, base_world: np.ndarray, base_quat: np.ndarra
     )
 
 
-def _stack_placement_goals(support_points: np.ndarray, moving_dims: np.ndarray, base_path: str):
+def _lift_height(spec: dict, grasp_style: str) -> float:
+    """Raise a side-grasped mug clear of the counter. Blocks keep the short lift."""
+    if grasp_style == "side" or spec.get("kind") in {"asset", "mug", "cup"}:
+        return MUG_LIFT_HEIGHT
+    return LIFT_HEIGHT
+
+
+def _placement_clearance(support_spec: dict | None) -> float:
+    """Hover higher over a plate. Other supports keep the block stacking clearance."""
+    from pseudo_vla.perception import STANDOFF_Z
+
+    if support_spec is not None and support_spec.get("kind") == "plate":
+        return PLATE_HOVER_CLEARANCE
+    return STANDOFF_Z
+
+
+def _side_placement_goals(
+    support_points: np.ndarray,
+    grasp_hand_world: np.ndarray,
+    object_center_world: np.ndarray,
+    surface_z: float,
+    grasp_quaternion: np.ndarray,
+    base_path: str,
+    clearance: float,
+):
+    """Hover and release a side grasp without rotating into a lower top-down pose."""
+    from pseudo_vla.perception import (
+        ApproachGoal,
+        prim_world_pose,
+        side_grasp_placement_world,
+        world_to_base,
+    )
+
+    preplace_world, place_world, moving_center, support_top = side_grasp_placement_world(
+        support_points,
+        grasp_hand_world,
+        object_center_world,
+        surface_z,
+        clearance,
+    )
+    base_world, base_quat = prim_world_pose(base_path)
+    quaternion = np.asarray(grasp_quaternion, dtype=np.float64).copy()
+    quaternion /= np.linalg.norm(quaternion)
+    preplace = ApproachGoal(
+        position=world_to_base(preplace_world.reshape(1, 3), base_world, base_quat)[0],
+        quaternion=quaternion,
+        center_world=moving_center.copy(),
+        top_z=support_top,
+    )
+    place = ApproachGoal(
+        position=world_to_base(place_world.reshape(1, 3), base_world, base_quat)[0],
+        quaternion=quaternion.copy(),
+        center_world=moving_center.copy(),
+        top_z=support_top,
+    )
+    return preplace, place
+
+
+def _stack_placement_goals(
+    support_points: np.ndarray,
+    moving_dims: np.ndarray,
+    base_path: str,
+    clearance: float | None = None,
+):
     from pseudo_vla.perception import (
         ApproachGoal,
         STANDOFF_Z,
@@ -1212,7 +1301,7 @@ def _stack_placement_goals(support_points: np.ndarray, moving_dims: np.ndarray, 
         support_points,
         moving_dims,
         GRIPPER_FINGER_REACH,
-        STANDOFF_Z,
+        STANDOFF_Z if clearance is None else clearance,
     )
     base_world, base_quat = prim_world_pose(base_path)
     quaternion = quat_multiply(quat_inverse(base_quat), TOP_DOWN_WXYZ)

@@ -24,6 +24,7 @@ from pseudo_vla.geometry import (
     quat_inverse,
     quat_multiply,
     sample_mask_points,
+    side_grasp_placement_world,
     stack_placement_world,
     tracked_surface_top,
     unproject_tracks,

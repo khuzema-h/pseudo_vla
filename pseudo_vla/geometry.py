@@ -305,6 +305,36 @@ def tracked_surface_top(points: np.ndarray) -> float:
     return float(np.max(inliers))
 
 
+def side_grasp_placement_world(
+    support_points: np.ndarray,
+    grasp_hand_world: np.ndarray,
+    object_center_world: np.ndarray,
+    surface_z: float,
+    clearance: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Lower a side grasp until the object sits on the support.
+
+    The release is the grasp pose translated onto the support. The hand keeps
+    the height it had above the counter, instead of switching to a top-down
+    palm pose below the contact height.
+    """
+    if support_points.ndim != 2 or support_points.shape[1] != 3 or support_points.shape[0] == 0:
+        raise ValueError("Support points must be a non-empty Nx3 array")
+    hand = np.asarray(grasp_hand_world, dtype=np.float64).reshape(3)
+    center = np.asarray(object_center_world, dtype=np.float64).reshape(3)
+    support_xy = np.median(support_points[:, :2], axis=0)
+    support_top = tracked_surface_top(support_points)
+    place = hand.copy()
+    place[:2] += support_xy - center[:2]
+    place[2] = float(support_top) + (float(hand[2]) - float(surface_z))
+    preplace = place.copy()
+    preplace[2] += float(clearance)
+    moved_center = center.copy()
+    moved_center[:2] = support_xy
+    moved_center[2] = float(center[2]) + (float(place[2]) - float(hand[2]))
+    return preplace, place, moved_center, support_top
+
+
 def stack_placement_world(
     support_points: np.ndarray,
     moving_dims: np.ndarray,

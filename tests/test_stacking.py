@@ -5,6 +5,7 @@ from unittest.mock import patch
 import numpy as np
 
 from pseudo_vla import controller as track_and_servo
+from pseudo_vla import motion
 from pseudo_vla import perception
 from pseudo_vla import stacking_llm
 
@@ -352,6 +353,106 @@ class StackingPerceptionTests(unittest.TestCase):
         np.testing.assert_allclose(transit_goal.position[:2], hover_goal.position[:2])
         self.assertAlmostEqual(transit_goal.position[2], 0.06 + 0.10 + 0.15)
         np.testing.assert_array_equal(transit_goal.quaternion, hover_goal.quaternion)
+
+    def test_mug_lift_and_plate_hover_are_higher_than_block_stacking(self):
+        self.assertGreater(
+            track_and_servo._lift_height({"kind": "asset"}, "side"),
+            track_and_servo.LIFT_HEIGHT,
+        )
+        self.assertEqual(track_and_servo._lift_height({"kind": "cube"}, "auto"), track_and_servo.LIFT_HEIGHT)
+        self.assertEqual(track_and_servo._placement_clearance({"kind": "cube"}), perception.STANDOFF_Z)
+        self.assertGreater(
+            track_and_servo._placement_clearance({"kind": "plate"}),
+            perception.STANDOFF_Z,
+        )
+
+        support_points = np.array(
+            [
+                [0.40, 0.10, 0.90],
+                [0.42, 0.10, 0.91],
+                [0.40, 0.12, 0.90],
+                [0.42, 0.12, 0.91],
+            ],
+            dtype=np.float64,
+        )
+        dims = np.array([0.08, 0.08, 0.10])
+        with (
+            patch(
+                "pseudo_vla.perception.prim_world_pose",
+                return_value=(np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])),
+            ),
+            patch("pseudo_vla.perception.world_to_base", side_effect=lambda points, *_: points),
+            patch("pseudo_vla.perception.quat_inverse", return_value=np.array([1.0, 0.0, 0.0, 0.0])),
+            patch("pseudo_vla.perception.quat_multiply", return_value=np.array([1.0, 0.0, 0.0, 0.0])),
+        ):
+            block_preplace, block_place = track_and_servo._stack_placement_goals(
+                support_points, dims, "/base"
+            )
+            plate_preplace, plate_place = track_and_servo._stack_placement_goals(
+                support_points,
+                dims,
+                "/base",
+                clearance=track_and_servo._placement_clearance({"kind": "plate"}),
+            )
+
+        np.testing.assert_allclose(plate_place.position, block_place.position)
+        self.assertAlmostEqual(
+            plate_preplace.position[2] - block_preplace.position[2],
+            track_and_servo.PLATE_HOVER_CLEARANCE - perception.STANDOFF_Z,
+        )
+
+    def test_side_grasp_place_stays_at_the_grasp_orientation(self):
+        support_points = np.array(
+            [
+                [-0.36, -0.26, 0.910],
+                [-0.32, -0.26, 0.916],
+                [-0.36, -0.22, 0.912],
+                [-0.32, -0.22, 0.914],
+            ],
+            dtype=np.float64,
+        )
+        grasp_quaternion = np.array([0.65, 0.20, 0.70, 0.18])
+        with (
+            patch(
+                "pseudo_vla.perception.prim_world_pose",
+                return_value=(np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])),
+            ),
+            patch("pseudo_vla.perception.world_to_base", side_effect=lambda points, *_: points),
+        ):
+            preplace, place = track_and_servo._side_placement_goals(
+                support_points,
+                np.array([0.05, -0.28, 1.00]),
+                np.array([-0.04, -0.28, 0.95]),
+                0.90,
+                grasp_quaternion,
+                "/base",
+                clearance=0.30,
+            )
+
+        np.testing.assert_allclose(place.position, [-0.25, -0.24, 1.016])
+        self.assertAlmostEqual(preplace.position[2] - place.position[2], 0.30)
+        np.testing.assert_allclose(place.quaternion, grasp_quaternion / np.linalg.norm(grasp_quaternion))
+        np.testing.assert_allclose(preplace.quaternion, place.quaternion)
+
+    def test_blocked_descent_releases_instead_of_planning_lower(self):
+        hand = np.array([-0.25, -0.24, 1.04])
+        goal = np.array([-0.25, -0.24, 1.00])
+        supported, stall_step, stall_z = motion.descent_is_supported(hand, goal, None, None, 0)
+        self.assertFalse(supported)
+        supported, stall_step, stall_z = motion.descent_is_supported(
+            hand, goal, stall_step, stall_z, motion.DESCENT_STALL_STEPS
+        )
+        self.assertTrue(supported)
+        self.assertEqual(stall_step, 0)
+
+        descending, _, _ = motion.descent_is_supported(
+            np.array([-0.25, -0.24, 1.03]), goal, 0, 1.04, 10
+        )
+        self.assertFalse(descending)
+        far, _, _ = motion.descent_is_supported(
+            np.array([0.0, 0.0, 1.04]), goal, 0, 1.04, motion.DESCENT_STALL_STEPS
+        )
+        self.assertFalse(far)
 
     def test_object_mask_prompt_uses_environment_camera_grounding(self):
         image = np.zeros((480, 480, 3), dtype=np.uint8)
