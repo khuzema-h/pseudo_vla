@@ -38,6 +38,10 @@
       "type": "choice",
       "instructions": "The next skill is blocked in the symbolic world. Which one listed repair should run first? Select unsupported if none of the repairs is appropriate."
     },
+    "phase_event": {
+      "type": "choice",
+      "instructions": "Choose the expected phase of the current skill, or one listed recovery after a failure. Otherwise stop."
+    },
     "task_event": {
       "type": "choice",
       "instructions": "Choose the expected event only if the validated plan and last completed event support proceeding. Otherwise stop at this safe boundary."

@@ -245,7 +245,12 @@ def choose_task_event(
     last_event_result: dict[str, object] | None,
     plan: TaskPlan | None = None,
 ) -> str:
-    """Ask Tev1 to authorize one expected task event at the current safe boundary."""
+    """Authorize one expected pick-and-place event, or stop.
+
+    This is the legacy wrapper around the phase machine. It offers only the
+    event the controller already expects, plus stop, and it never offers a
+    recovery. New skills use choose_phase_event instead.
+    """
     if event not in TASK_EVENTS:
         raise ValueError(f"Unsupported task event {event!r}")
     if action_index < 0:
