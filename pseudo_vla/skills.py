@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
-from pseudo_vla.task_plan import DESTINATION_KINDS
+_DESTINATION_KINDS = ("at", "on", "left_of", "right_of", "inside")
 
 PHASES: dict[str, tuple[str, ...]] = {
     "pick": ("approach", "grasp", "lift", "verify_grasp"),
@@ -171,7 +171,7 @@ def _require_place(world: World, slots: Mapping[str, str]) -> str | None:
     target = slots["target"]
     if world.held != obj:
         return "not_held"
-    if kind not in DESTINATION_KINDS:
+    if kind not in _DESTINATION_KINDS:
         return "bad_destination"
     if obj == target:
         return "bad_destination"

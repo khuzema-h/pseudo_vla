@@ -36,11 +36,16 @@ def interpret_task_prompt(user_prompt: str, scene_state: dict[str, object] | Non
         {
             "find": "Find, locate, or identify one object without moving it.",
             "pick_place": "Move one or more listed objects to listed destinations.",
+            "skill_sequence": "Run a sequence of registered skills, including skills other than a plain move.",
             "unsupported": "The requested operation is not supported by the available handlers.",
         },
     )
     if intent == "unsupported":
         raise Tev1Error("Tev1 classified the instruction as an unsupported task")
+    if intent == "skill_sequence":
+        from pseudo_vla.planner import plan_steps
+
+        return plan_steps(instruction, state)
     if intent == "find":
         candidates = _option_criteria(objects, "Find the scene object")
         candidates["none"] = "No listed scene object matches the requested object."
@@ -159,7 +164,7 @@ def interpret_task_prompt(user_prompt: str, scene_state: dict[str, object] | Non
     if not actions:
         raise Tev1Error("Tev1 did not select any supported pick-and-place actions")
     try:
-        return validate_task_plan(
+        plan = validate_task_plan(
             "pick_place",
             "",
             actions,
@@ -169,6 +174,30 @@ def interpret_task_prompt(user_prompt: str, scene_state: dict[str, object] | Non
         )
     except ValueError as error:
         raise Tev1Error(f"Could not validate Tev1 task plan: {error}") from error
+    return _with_skill_steps(plan)
+
+
+def _with_skill_steps(plan: TaskPlan) -> TaskPlan:
+    """Keep the older action list and record the same moves as primitive skills."""
+    from pseudo_vla.skills import step
+
+    steps = []
+    for action in plan.actions:
+        steps.append(step("pick", object=action.object_id))
+        steps.append(
+            step(
+                "place",
+                object=action.object_id,
+                kind=action.destination.kind,
+                target=action.destination.target,
+            )
+        )
+    return TaskPlan(
+        intent=plan.intent,
+        query=plan.query,
+        actions=plan.actions,
+        steps=tuple(steps),
+    )
 
 
 def _scene_catalog(

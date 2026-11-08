@@ -4,7 +4,7 @@
   "questions": {
     "task_intent": {
       "type": "choice",
-      "instructions": "Which supported high-level task best matches the user's instruction? Choose only find or pick_place when one clearly applies."
+      "instructions": "Which supported high-level task best matches the user's instruction? Choose find when the user only wants an object located. Choose pick_place when the user wants listed objects moved to listed destinations. Choose skill_sequence when the request needs a registered skill other than a plain move."
     },
     "find_target": {
       "type": "choice",
@@ -29,6 +29,14 @@
     "destination_target": {
       "type": "choice",
       "instructions": "Which listed scene object, location, or container is the requested destination?"
+    },
+    "skill_next": {
+      "type": "choice",
+      "instructions": "Which listed skill should run next for the remaining instruction? Select unsupported if none of the listed skills matches."
+    },
+    "prerequisite_resolution": {
+      "type": "choice",
+      "instructions": "The next skill is blocked in the symbolic world. Which one listed repair should run first? Select unsupported if none of the repairs is appropriate."
     },
     "task_event": {
       "type": "choice",

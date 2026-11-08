@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 DestinationKind = Literal["at", "on", "left_of", "right_of", "inside"]
-TaskIntent = Literal["find", "pick_place"]
+TaskIntent = Literal["find", "pick_place", "skill_sequence"]
 DESTINATION_KINDS = ("at", "on", "left_of", "right_of", "inside")
 RELATIVE_DESTINATIONS = ("on", "left_of", "right_of")
 
@@ -36,6 +36,7 @@ class TaskPlan:
     intent: TaskIntent
     query: str | None = None
     actions: tuple[PickPlaceAction, ...] = ()
+    steps: tuple[object, ...] = ()
 
 
 def validate_task_plan(
