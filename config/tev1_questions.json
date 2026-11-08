@@ -42,6 +42,42 @@
       "type": "choice",
       "instructions": "Choose the expected phase of the current skill, or one listed recovery after a failure. Otherwise stop."
     },
+    "push_direction": {
+      "type": "choice",
+      "instructions": "Which listed direction should the object be pushed?"
+    },
+    "articulation_action": {
+      "type": "choice",
+      "instructions": "Which listed container should be opened or closed?"
+    },
+    "pour_target": {
+      "type": "choice",
+      "instructions": "Which listed object or container should receive the pour? Select none if no listed target matches."
+    },
+    "insert_receptacle": {
+      "type": "choice",
+      "instructions": "Which listed receptacle should receive or release the object? Select none if no listed receptacle matches."
+    },
+    "tool_object": {
+      "type": "choice",
+      "instructions": "Which listed object is the tool to use? Select none if no listed object is the tool."
+    },
+    "grasp_family": {
+      "type": "choice",
+      "instructions": "Which listed grasp family should the parallel gripper use?"
+    },
+    "transport_constraint": {
+      "type": "choice",
+      "instructions": "Which listed transport constraint applies while the object is carried or hung?"
+    },
+    "repeat_count": {
+      "type": "choice",
+      "instructions": "How many times should the previous skill be repeated? Choose only a listed count."
+    },
+    "needs_clarification": {
+      "type": "choice",
+      "instructions": "What is missing from the instruction? Choose only one listed gap."
+    },
     "task_event": {
       "type": "choice",
       "instructions": "Choose the expected event only if the validated plan and last completed event support proceeding. Otherwise stop at this safe boundary."

@@ -62,6 +62,8 @@ def plan_steps(user_prompt: str, scene_state: Mapping[str, object] | None = None
             planned.extend(prefix)
             world = simulate(world, [primitive])
             planned.append(primitive)
+        if REGISTRY[skill_name].ends_plan:
+            break
 
     if not planned:
         raise Tev1Error("Tev1 did not select any supported skills")

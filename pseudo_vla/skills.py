@@ -60,6 +60,7 @@ class World:
     on: tuple[tuple[str, str], ...] = ()
     inside: tuple[tuple[str, str], ...] = ()
     opened: tuple[str, ...] = ()
+    containers: tuple[str, ...] = ()
 
     @classmethod
     def from_scene_state(cls, scene_state: Mapping[str, object] | None) -> "World":
@@ -69,6 +70,7 @@ class World:
             on=_pairs(state.get("supported_by")),
             inside=_pairs(state.get("inside")),
             opened=_identifiers(state.get("opened", ())),
+            containers=_identifiers(state.get("containers", ())),
         )
 
     def support_of(self, object_id: str) -> str | None:
@@ -91,11 +93,11 @@ class World:
 
     def release(self, object_id: str) -> "World":
         """Drop every support and containment fact about one object."""
-        return World(
+        return _replace(
+            self,
             held=None if self.held == object_id else self.held,
             on=tuple(pair for pair in self.on if pair[0] != object_id),
             inside=tuple(pair for pair in self.inside if pair[0] != object_id),
-            opened=self.opened,
         )
 
 
@@ -136,6 +138,7 @@ class SkillSpec:
     apply: ApplyFn
     summary: str
     expands_to: tuple[str, ...] = ()
+    ends_plan: bool = False
 
     @property
     def offered(self) -> bool:
@@ -157,12 +160,7 @@ def _require_pick(world: World, slots: Mapping[str, str]) -> str | None:
 def _apply_pick(world: World, slots: Mapping[str, str]) -> World:
     obj = slots["object"]
     released = world.release(obj)
-    return World(
-        held=obj,
-        on=released.on,
-        inside=released.inside,
-        opened=released.opened,
-    )
+    return _replace(released, held=obj)
 
 
 def _require_place(world: World, slots: Mapping[str, str]) -> str | None:
@@ -191,7 +189,7 @@ def _apply_place(world: World, slots: Mapping[str, str]) -> World:
         on = tuple(sorted(on + ((obj, target),)))
     elif kind == "inside":
         inside = tuple(sorted(inside + ((obj, target),)))
-    return World(held=None, on=on, inside=inside, opened=released.opened)
+    return _replace(released, held=None, on=on, inside=inside)
 
 
 def _require_pick_place(world: World, slots: Mapping[str, str]) -> str | None:
@@ -271,10 +269,289 @@ def _target_options(
     }
 
 
+def _replace(world: World, **changes: object) -> World:
+    values: dict[str, object] = {
+        "held": world.held,
+        "on": world.on,
+        "inside": world.inside,
+        "opened": world.opened,
+        "containers": world.containers,
+    }
+    values.update(changes)
+    return World(**values)  # type: ignore[arg-type]
+
+
+def _require_free(world: World, slots: Mapping[str, str]) -> str | None:
+    if world.held:
+        return "gripper_full"
+    obj = slots.get("object")
+    if obj and world.resting_on(obj):
+        return "blocked"
+    if obj:
+        container = world.container_of(obj)
+        if container and not world.is_open(container):
+            return "closed_container"
+    return None
+
+
+def _require_open(world: World, slots: Mapping[str, str]) -> str | None:
+    if world.held:
+        return "gripper_full"
+    if world.is_open(slots["container"]):
+        return "already_open"
+    return None
+
+
+def _apply_open(world: World, slots: Mapping[str, str]) -> World:
+    container = slots["container"]
+    return _replace(world, opened=tuple(sorted((*world.opened, container))))
+
+
+def _require_close(world: World, slots: Mapping[str, str]) -> str | None:
+    if world.held:
+        return "gripper_full"
+    if not world.is_open(slots["container"]):
+        return "already_closed"
+    return None
+
+
+def _apply_close(world: World, slots: Mapping[str, str]) -> World:
+    container = slots["container"]
+    return _replace(world, opened=tuple(name for name in world.opened if name != container))
+
+
+def _apply_push(world: World, slots: Mapping[str, str]) -> World:
+    return world.release(slots["object"])
+
+
+def _require_insert(world: World, slots: Mapping[str, str]) -> str | None:
+    obj = slots["object"]
+    receptacle = slots["receptacle"]
+    if world.held != obj:
+        return "not_held"
+    if obj == receptacle:
+        return "bad_destination"
+    if receptacle in world.containers and not world.is_open(receptacle):
+        return "closed_container"
+    return None
+
+
+def _apply_insert(world: World, slots: Mapping[str, str]) -> World:
+    released = world.release(slots["object"])
+    inside = tuple(sorted(released.inside + ((slots["object"], slots["receptacle"]),)))
+    return _replace(released, held=None, inside=inside)
+
+
+def _require_extract(world: World, slots: Mapping[str, str]) -> str | None:
+    if world.held:
+        return "gripper_full"
+    obj = slots["object"]
+    receptacle = slots["receptacle"]
+    if world.container_of(obj) != receptacle:
+        return "not_inside"
+    if receptacle in world.containers and not world.is_open(receptacle):
+        return "closed_container"
+    return None
+
+
+def _apply_extract(world: World, slots: Mapping[str, str]) -> World:
+    return _apply_pick(world, {"object": slots["object"]})
+
+
+def _require_stack(world: World, slots: Mapping[str, str]) -> str | None:
+    if slots["moving"] == slots["base"]:
+        return "bad_destination"
+    return _require_pick_place(
+        world,
+        {"object": slots["moving"], "kind": "on", "target": slots["base"]},
+    )
+
+
+def _apply_stack(world: World, slots: Mapping[str, str]) -> World:
+    return _apply_pick_place(
+        world,
+        {"object": slots["moving"], "kind": "on", "target": slots["base"]},
+    )
+
+
+def _require_unstack(world: World, slots: Mapping[str, str]) -> str | None:
+    if world.support_of(slots["object"]) is None:
+        return "not_supported"
+    return _require_pick_place(world, slots)
+
+
+def _require_held_use(world: World, slots: Mapping[str, str]) -> str | None:
+    obj = slots.get("object") or slots.get("tool")
+    if not obj or world.held != obj:
+        return "not_held"
+    target = slots.get("target") or slots.get("receptacle")
+    if target and target == obj:
+        return "bad_destination"
+    return None
+
+
+def _require_repeat(world: World, slots: Mapping[str, str]) -> str | None:
+    del world
+    if slots.get("count") not in {"1", "2", "3"}:
+        return "bad_count"
+    return None
+
+
+def _identity(world: World, slots: Mapping[str, str]) -> World:
+    del slots
+    return world
+
+
+def _closed_container_options(world: World, catalog: Catalog, _filled: Mapping[str, str]) -> dict[str, str]:
+    return {
+        name: f"Closed container {name}."
+        for name in catalog.containers
+        if not world.is_open(name)
+    }
+
+
+def _open_container_options(world: World, catalog: Catalog, _filled: Mapping[str, str]) -> dict[str, str]:
+    return {
+        name: f"Open container {name}."
+        for name in catalog.containers
+        if world.is_open(name)
+    }
+
+
+def _direction_options(_world: World, _catalog: Catalog, _filled: Mapping[str, str]) -> dict[str, str]:
+    return {
+        "left": "Push toward world -X.",
+        "right": "Push toward world +X.",
+        "forward": "Push toward world +Y.",
+        "back": "Push toward world -Y.",
+    }
+
+
+def _parallel_grasp(_world: World, _catalog: Catalog, _filled: Mapping[str, str]) -> dict[str, str]:
+    return {"parallel": "Use the parallel gripper."}
+
+
+def _upright(_world: World, _catalog: Catalog, _filled: Mapping[str, str]) -> dict[str, str]:
+    return {"upright": "Keep the held object upright."}
+
+
+def _hang_constraint(_world: World, _catalog: Catalog, _filled: Mapping[str, str]) -> dict[str, str]:
+    return {
+        "upright": "Hang the object upright.",
+        "free": "Hang the object with no orientation constraint.",
+    }
+
+
+def _other_object_options(world: World, catalog: Catalog, filled: Mapping[str, str]) -> dict[str, str]:
+    moving = filled.get("object") or filled.get("tool") or filled.get("moving") or world.held
+    return {
+        object_id: f"Use {object_id}."
+        for object_id in catalog.objects
+        if object_id != moving
+    }
+
+
+def _receptacle_options(world: World, catalog: Catalog, filled: Mapping[str, str]) -> dict[str, str]:
+    moving = filled.get("object") or world.held
+    options = {
+        object_id: f"Insert into object {object_id}."
+        for object_id in catalog.objects
+        if object_id != moving
+    }
+    options.update(
+        {
+            name: f"Insert into open container {name}."
+            for name in catalog.containers
+            if world.is_open(name) and name != moving
+        }
+    )
+    return options
+
+
+def _extract_object_options(world: World, catalog: Catalog, _filled: Mapping[str, str]) -> dict[str, str]:
+    contained = {obj for obj, _container in world.inside}
+    return {
+        object_id: f"Extract {object_id}."
+        for object_id in catalog.objects
+        if object_id in contained and object_id != world.held
+    }
+
+
+def _extract_receptacle_options(world: World, _catalog: Catalog, filled: Mapping[str, str]) -> dict[str, str]:
+    obj = filled.get("object")
+    container = world.container_of(obj) if obj else None
+    if container is None:
+        return {}
+    return {container: f"{obj} is inside {container}."}
+
+
+def _stack_base_options(_world: World, catalog: Catalog, _filled: Mapping[str, str]) -> dict[str, str]:
+    return {object_id: f"Use {object_id} as the stack support." for object_id in catalog.objects}
+
+
+def _stack_next_options(_world: World, catalog: Catalog, filled: Mapping[str, str]) -> dict[str, str]:
+    base = filled.get("base")
+    return {
+        object_id: f"Place {object_id} on {base}."
+        for object_id in catalog.objects
+        if object_id != base
+    }
+
+
+def _supported_object_options(world: World, catalog: Catalog, _filled: Mapping[str, str]) -> dict[str, str]:
+    return {
+        object_id: f"Unstack {object_id}."
+        for object_id in catalog.objects
+        if world.support_of(object_id) and object_id != world.held
+    }
+
+
+def _pour_target_options(world: World, catalog: Catalog, filled: Mapping[str, str]) -> dict[str, str]:
+    moving = filled.get("object") or world.held
+    options = _other_object_options(world, catalog, {"object": moving or ""})
+    options.update(
+        {
+            name: f"Pour into open container {name}."
+            for name in catalog.containers
+            if world.is_open(name)
+        }
+    )
+    return options
+
+
+def _repeat_options(_world: World, _catalog: Catalog, _filled: Mapping[str, str]) -> dict[str, str]:
+    return {str(count): f"Repeat the previous skill {count} times." for count in (1, 2, 3)}
+
+
+def _clarification_options(_world: World, _catalog: Catalog, _filled: Mapping[str, str]) -> dict[str, str]:
+    return {
+        "missing_object": "The instruction does not identify the object.",
+        "missing_destination": "The instruction does not identify the destination.",
+        "ambiguous_skill": "More than one skill matches the instruction.",
+    }
+
+
 _OBJECT = Slot("object", "moving_object", _object_options)
 _HELD_OBJECT = Slot("object", "moving_object", _held_or_object_options)
 _KIND = Slot("kind", "destination_kind", _kind_options)
 _TARGET = Slot("target", "destination_target", _target_options)
+_CONTAINER = Slot("container", "articulation_action", _closed_container_options)
+_OPEN_CONTAINER = Slot("container", "articulation_action", _open_container_options)
+_DIRECTION = Slot("direction", "push_direction", _direction_options)
+_GRASP = Slot("grasp_family", "grasp_family", _parallel_grasp)
+_UPRIGHT = Slot("transport_constraint", "transport_constraint", _upright)
+_HANG_CONSTRAINT = Slot("transport_constraint", "transport_constraint", _hang_constraint)
+_RECEPTACLE = Slot("receptacle", "insert_receptacle", _receptacle_options)
+_POUR_TARGET = Slot("target", "pour_target", _pour_target_options)
+_TOOL = Slot("tool", "tool_object", _object_options)
+_OTHER = Slot("target", "moving_object", _other_object_options)
+_STACK_BASE = Slot("base", "stack_base", _stack_base_options)
+_STACK_NEXT = Slot("moving", "stack_next", _stack_next_options)
+_SUPPORTED = Slot("object", "moving_object", _supported_object_options)
+_EXTRACT_OBJECT = Slot("object", "moving_object", _extract_object_options)
+_EXTRACT_RECEPTACLE = Slot("receptacle", "insert_receptacle", _extract_receptacle_options)
+_REPEAT = Slot("count", "repeat_count", _repeat_options)
+_CLARIFY = Slot("topic", "needs_clarification", _clarification_options)
 
 REGISTRY: dict[str, SkillSpec] = {
     "pick": SkillSpec(
@@ -302,6 +579,139 @@ REGISTRY: dict[str, SkillSpec] = {
         summary="Pick one object and put it at a listed destination.",
         expands_to=("pick", "place"),
     ),
+    "open": SkillSpec(
+        name="open",
+        slots=(_CONTAINER,),
+        phases=PHASES["open"],
+        requires=_require_open,
+        apply=_apply_open,
+        summary="Open one closed container.",
+    ),
+    "close": SkillSpec(
+        name="close",
+        slots=(_OPEN_CONTAINER,),
+        phases=PHASES["close"],
+        requires=_require_close,
+        apply=_apply_close,
+        summary="Close one open container.",
+    ),
+    "push": SkillSpec(
+        name="push",
+        slots=(_OBJECT, _DIRECTION),
+        phases=PHASES["push"],
+        requires=_require_free,
+        apply=_apply_push,
+        summary="Push one clear object along a listed direction.",
+    ),
+    "press": SkillSpec(
+        name="press",
+        slots=(_OBJECT,),
+        phases=PHASES["press"],
+        requires=_require_free,
+        apply=_identity,
+        summary="Press one clear object.",
+    ),
+    "rotate": SkillSpec(
+        name="rotate",
+        slots=(_OBJECT, _GRASP),
+        phases=PHASES["rotate"],
+        requires=_require_free,
+        apply=_identity,
+        summary="Rotate one clear object with the parallel gripper.",
+    ),
+    "insert": SkillSpec(
+        name="insert",
+        slots=(_HELD_OBJECT, _RECEPTACLE),
+        phases=PHASES["insert"],
+        requires=_require_insert,
+        apply=_apply_insert,
+        summary="Insert the held object into a listed receptacle.",
+    ),
+    "extract": SkillSpec(
+        name="extract",
+        slots=(_EXTRACT_OBJECT, _EXTRACT_RECEPTACLE),
+        phases=PHASES["pick"],
+        requires=_require_extract,
+        apply=_apply_extract,
+        summary="Take one object out of the container it is inside.",
+    ),
+    "stack": SkillSpec(
+        name="stack",
+        slots=(_STACK_BASE, _STACK_NEXT),
+        phases=PHASES["pick"] + PHASES["place"],
+        requires=_require_stack,
+        apply=_apply_stack,
+        summary="Pick one object and place it on a chosen support.",
+        expands_to=("pick", "place"),
+    ),
+    "unstack": SkillSpec(
+        name="unstack",
+        slots=(_SUPPORTED, _KIND, _TARGET),
+        phases=PHASES["pick"] + PHASES["place"],
+        requires=_require_unstack,
+        apply=_apply_pick_place,
+        summary="Pick a supported object and place it at a listed destination.",
+        expands_to=("pick", "place"),
+    ),
+    "pour": SkillSpec(
+        name="pour",
+        slots=(_HELD_OBJECT, _POUR_TARGET, _UPRIGHT),
+        phases=PHASES["pour"],
+        requires=_require_held_use,
+        apply=_identity,
+        summary="Pour from the held object into a listed target.",
+    ),
+    "use_tool": SkillSpec(
+        name="use_tool",
+        slots=(_TOOL, _OTHER, _GRASP),
+        phases=("approach", "contact", "verify_effect"),
+        requires=_require_held_use,
+        apply=_identity,
+        summary="Use one held tool on another object.",
+    ),
+    "hang": SkillSpec(
+        name="hang",
+        slots=(_HELD_OBJECT, _OTHER, _HANG_CONSTRAINT),
+        phases=("move_above", "place", "retreat", "verify_effect"),
+        requires=_require_held_use,
+        apply=lambda world, slots: _apply_place(
+            world, {"object": slots["object"], "kind": "on", "target": slots["target"]}
+        ),
+        summary="Hang the held object on a listed support.",
+    ),
+    "wait": SkillSpec(
+        name="wait",
+        slots=(),
+        phases=("wait",),
+        requires=lambda world, slots: None,
+        apply=_identity,
+        summary="Wait without moving the arm.",
+    ),
+    "go_home": SkillSpec(
+        name="go_home",
+        slots=(),
+        phases=("retreat",),
+        requires=lambda world, slots: None,
+        apply=_identity,
+        summary="Move the arm back to its home pose.",
+    ),
+    "repeat": SkillSpec(
+        name="repeat",
+        slots=(_REPEAT,),
+        phases=("wait",),
+        requires=_require_repeat,
+        apply=_identity,
+        summary="Repeat the previous skill one, two, or three times.",
+    ),
+    "ask_clarification": SkillSpec(
+        name="ask_clarification",
+        slots=(_CLARIFY,),
+        phases=("ask",),
+        requires=lambda world, slots: None,
+        apply=_identity,
+        summary="Stop and ask the user to clarify the instruction.",
+        ends_plan=True,
+    ),
 }
 
 
@@ -312,6 +722,16 @@ def expand(skill_step: SkillStep) -> tuple[SkillStep, ...]:
         return (skill_step,)
     slots = skill_step.as_dict()
     if skill_step.skill == "pick_place":
+        return (
+            step("pick", object=slots["object"]),
+            step("place", object=slots["object"], kind=slots["kind"], target=slots["target"]),
+        )
+    if skill_step.skill == "stack":
+        return (
+            step("pick", object=slots["moving"]),
+            step("place", object=slots["moving"], kind="on", target=slots["base"]),
+        )
+    if skill_step.skill == "unstack":
         return (
             step("pick", object=slots["object"]),
             step("place", object=slots["object"], kind=slots["kind"], target=slots["target"]),
