@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 from functools import lru_cache
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -228,6 +229,7 @@ def _post_json(path: str, payload: dict[str, object]) -> dict[str, object]:
         method="POST",
     )
     try:
+        started = time.perf_counter()
         with urlopen(request, timeout=TEV1_TIMEOUT) as response:
             result = json.loads(response.read())
     except HTTPError as error:
@@ -239,4 +241,38 @@ def _post_json(path: str, payload: dict[str, object]) -> dict[str, object]:
         raise Tev1Error(f"Ollama {path} returned invalid JSON") from error
     if not isinstance(result, dict):
         raise Tev1Error(f"Ollama {path} returned a non-object response")
+    _log_tev1_call(payload, result, time.perf_counter() - started)
     return result
+
+
+def _log_tev1_call(payload: dict[str, object], result: dict[str, object], seconds: float) -> None:
+    """Append one JSONL record per question when TEV1_CALL_LOG is set."""
+    raw_path = os.environ.get("TEV1_CALL_LOG", "").strip()
+    if not raw_path:
+        return
+    questions = payload.get("questions")
+    answers = result.get("answers")
+    if not isinstance(questions, dict):
+        return
+    try:
+        destination = Path(raw_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("a", encoding="utf-8") as handle:
+            for key, question in questions.items():
+                options = question.get("criteria") if isinstance(question, dict) else None
+                answer = answers.get(key) if isinstance(answers, dict) else None
+                handle.write(
+                    json.dumps(
+                        {
+                            "question": key,
+                            "state": payload.get("state"),
+                            "options": options,
+                            "answer": answer,
+                            "latency_ms": round(seconds * 1000, 3),
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+    except OSError:
+        return
