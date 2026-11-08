@@ -57,6 +57,11 @@ LIFT_HEIGHT = 0.20
 # and the plate.
 MUG_LIFT_HEIGHT = 0.40
 PLATE_HOVER_CLEARANCE = 0.30
+# Leave the mug this far above the plate collision top.
+PLATE_RELEASE_BUFFER = 0.01
+# A measured mug-to-plate gap outside this range is not used as the release descent.
+MASK_DESCENT_MIN = 0.01
+MASK_DESCENT_MAX = 0.45
 STACK_TRANSIT_CLEARANCE = 0.15
 APPROACH_TRANSIT_RADIUS = 0.35
 APPROACH_TRANSIT_HEIGHT = 0.02
@@ -369,7 +374,8 @@ def _find_object(scene, perception, prompt: str, query: str, say, view) -> bool:
         return False
     queries = perception.segment(rgb, point, box)
     save_overlay(ROOT / "outputs" / "frame0_overlay.png", rgb, perception.mask, queries)
-    _update_camera_views(scene, view, rgb, depth, perception.mask, queries)
+    perception.release_sam()
+    _update_camera_views(scene, view, rgb, depth, None, queries)
     say(f'found "{query}" in the environment camera')
     return True
 
@@ -452,8 +458,9 @@ def _move_to_prompt(
                     rgb, {group_name: (point, box)}
                 )[group_name]
             save_overlay(ROOT / "outputs" / "frame0_overlay.png", rgb, perception.mask, queries)
-            _update_camera_views(scene, view, rgb, depth, perception.mask, queries)
             say(f"SAM 2 mask pixels {int(perception.mask.sum())}")
+            perception.release_sam()
+            _update_camera_views(scene, view, rgb, depth, None, queries)
             started = True
             continue
         tracked = perception.push_frame(rgb)
@@ -482,7 +489,7 @@ def _move_to_prompt(
                 )
                 servo.update_goal(goal, scene.joint_positions())
         if last_points is None:
-            _update_camera_views(scene, view, rgb, depth, perception.mask, perception.query_xy)
+            _update_camera_views(scene, view, rgb, depth, None, perception.query_xy)
         else:
             _update_camera_views(scene, view, rgb, depth, None, last_points, last_visible)
         command = servo.command()
@@ -655,7 +662,8 @@ def _run_stack_phase(
                 f"seen affordance {affordance} seeded {len(region_points)} CoTracker points "
                 f"on the grasp region of {moving_name}"
             )
-    _update_camera_views(scene, view, rgb, depth, perception.mask, perception.query_xy)
+    perception.release_sam()
+    _update_camera_views(scene, view, rgb, depth, None, perception.query_xy)
     if target_name is not None:
         say(
             f"tracking {target_name} and {moving_name} with "
@@ -878,7 +886,7 @@ def _stack_tracked_cube(
             view,
             rgb,
             depth,
-            None if tracked is not None else perception.mask,
+            None,
             tracks_xy if tracked is not None else perception.query_xy,
             visible if tracked is not None else None,
         )
@@ -1025,12 +1033,6 @@ def _stack_tracked_cube(
             else:
                 say(f"could not lower the gripper to grasp {moving_name}")
             return False
-        retained_groups = ("support",) if destination.kind == "on" else None
-        if retained_groups:
-            scene.step()
-            rgb, depth, _ = scene.read_sensors()
-            perception.retain_groups(rgb, retained_groups)
-            _update_camera_views(scene, view, rgb, depth, perception.mask, perception.query_xy)
         say(f"closing the gripper on {moving_name}")
         pending = _close_gripper_in_place(scene, perception, commands, view)
         if pending is not None:
@@ -1128,7 +1130,7 @@ def _stack_tracked_cube(
                 view,
                 rgb,
                 depth,
-                None if tracks_xy is not None else perception.mask,
+                None,
                 tracks_xy if tracks_xy is not None else perception.query_xy,
                 visible,
             )
@@ -1141,6 +1143,16 @@ def _stack_tracked_cube(
             return False
 
         assert place_goal is not None and preplace_goal is not None
+        if grasp_style == "side" and destination.kind == "on" and target_name:
+            lowered = _place_goal_for_collision_gap(
+                scene,
+                moving_name,
+                target_name,
+                preplace_goal,
+                say,
+            )
+            if lowered is not None:
+                place_goal = lowered
         if destination.kind in {"left_of", "right_of"} and not _relative_slot_is_clear(
             scene, moving_name, destination
         ):
@@ -1236,6 +1248,142 @@ def _placement_clearance(support_spec: dict | None) -> float:
     if support_spec is not None and support_spec.get("kind") == "plate":
         return PLATE_HOVER_CLEARANCE
     return STANDOFF_Z
+
+
+def _place_goal_for_collision_gap(scene, moving_name: str, support_name: str, preplace_goal, say):
+    """Lower the hover pose until the mug collision box is a buffer above the plate."""
+    from pseudo_vla.geometry import collision_vertical_gap
+    from pseudo_vla.scene import spec_by_id, world_collision_bounds
+
+    moving_spec = spec_by_id(moving_name)
+    support_spec = spec_by_id(support_name)
+    paths = getattr(scene, "object_paths", {}) or {}
+    moving_path = None if moving_spec is None else paths.get(moving_spec["name"])
+    support_path = None if support_spec is None else paths.get(support_spec["name"])
+    if not moving_path or not support_path:
+        say(f"no collision prim for the {moving_name} to {support_name} descent")
+        return None
+    try:
+        moving_min, moving_max = world_collision_bounds(moving_path)
+        support_min, support_max = world_collision_bounds(support_path)
+        gap = float(collision_vertical_gap(moving_min, moving_max, support_min, support_max))
+    except RuntimeError as error:
+        say(f"could not read collision bounds for {moving_name} and {support_name}: {error}")
+        return None
+    say(
+        f"{moving_name} collision bottom {moving_min[2]:.3f}, "
+        f"{support_name} collision top {support_max[2]:.3f}"
+    )
+    return _release_goal_from_gap(gap, moving_name, support_name, preplace_goal, scene.base_path, say)
+
+
+def _place_goal_for_mask_gap(
+    perception,
+    rgb: np.ndarray,
+    depth: np.ndarray,
+    camera_params: dict,
+    camera_path: str,
+    base_path: str,
+    moving_name: str,
+    support_name: str,
+    preplace_goal,
+    say,
+):
+    """Lower the hover pose by the depth gap between the moving and support masks."""
+    from pseudo_vla.geometry import descent_between_masks, descent_between_points
+    from pseudo_vla.scene import object_phrase, spec_by_id
+
+    latest = perception.latest_tracks() if hasattr(perception, "latest_tracks") else None
+    groups = getattr(perception, "query_groups", None) or {}
+    if latest is not None and "moving" in groups and "support" in groups:
+        tracks_xy, tracks_visible = latest
+        try:
+            gap = float(
+                descent_between_points(
+                    perception.tracked_group_points(
+                        "moving", tracks_xy, tracks_visible, depth, camera_params, camera_path
+                    ),
+                    perception.tracked_group_points(
+                        "support", tracks_xy, tracks_visible, depth, camera_params, camera_path
+                    ),
+                )
+            )
+        except ValueError as error:
+            say(f"could not measure the tracked gap between {moving_name} and {support_name}: {error}")
+            return None
+        return _release_goal_from_gap(
+            gap, moving_name, support_name, preplace_goal, base_path, say
+        )
+
+    moving_spec = spec_by_id(moving_name)
+    support_spec = spec_by_id(support_name)
+    if moving_spec is None or support_spec is None:
+        say(f"no scene object for the {moving_name} to {support_name} mask descent")
+        return None
+    moving_phrase = object_phrase(moving_spec)
+    support_phrase = object_phrase(support_spec)
+    located = perception.ground_all(rgb, [moving_phrase, support_phrase])
+    masks = {}
+    for name, phrase in ((moving_name, moving_phrase), (support_name, support_phrase)):
+        found = located.get(phrase)
+        if found is None:
+            say(f"environment camera could not box {name} for the placement descent")
+            return None
+        box, _score = found
+        try:
+            masks[name] = perception.segment_region(rgb, box=box)
+        except RuntimeError as error:
+            say(f"environment camera could not segment {name} for the placement descent: {error}")
+            return None
+    try:
+        gap = float(
+            descent_between_masks(
+                masks[moving_name],
+                masks[support_name],
+                depth,
+                camera_params,
+                camera_path,
+            )
+        )
+    except ValueError as error:
+        say(f"could not measure the mask gap between {moving_name} and {support_name}: {error}")
+        return None
+    return _release_goal_from_gap(gap, moving_name, support_name, preplace_goal, base_path, say)
+
+
+def _release_goal_from_gap(gap: float, moving_name: str, support_name: str, preplace_goal, base_path: str, say):
+    """Stop short of the support by the plate buffer, then build the release pose."""
+    if gap < MASK_DESCENT_MIN or gap > MASK_DESCENT_MAX:
+        say(
+            f"mask gap between {moving_name} and {support_name} is {gap:.3f} m; "
+            "keeping the geometric place height"
+        )
+        return None
+    descent = max(0.0, gap - PLATE_RELEASE_BUFFER)
+    say(
+        f"{moving_name} is {gap:.3f} m above the {support_name}; "
+        f"stopping {PLATE_RELEASE_BUFFER:.2f} m above the plate and lowering {descent:.3f} m before release"
+    )
+    return _place_goal_from_mask_gap(preplace_goal, descent, base_path)
+
+
+def _place_goal_from_mask_gap(preplace_goal, gap: float, base_path: str):
+    """Drop the hover hand straight down by a measured mask gap."""
+    from pseudo_vla.perception import ApproachGoal, base_to_world, prim_world_pose, world_to_base
+
+    base_world, base_quat = prim_world_pose(base_path)
+    world = base_to_world(
+        np.asarray(preplace_goal.position, dtype=np.float64).reshape(1, 3),
+        base_world,
+        base_quat,
+    )[0].copy()
+    world[2] -= float(gap)
+    return ApproachGoal(
+        position=world_to_base(world.reshape(1, 3), base_world, base_quat)[0],
+        quaternion=np.asarray(preplace_goal.quaternion, dtype=np.float64).copy(),
+        center_world=np.asarray(preplace_goal.center_world, dtype=np.float64).copy(),
+        top_z=float(preplace_goal.top_z),
+    )
 
 
 def _side_placement_goals(
@@ -1568,8 +1716,9 @@ def _seed_placed_cube_tracking(scene, perception, object_name: str, say, view) -
         say(f"environment camera could not reseed tracking for {object_name}")
         return
     perception.segment_groups(rgb, {object_name: (None, box)})
+    perception.release_sam()
     say(f"dropped stale CoTracker points; tracking the placed {object_name} cube")
-    _update_camera_views(scene, view, rgb, depth, perception.mask, perception.query_xy)
+    _update_camera_views(scene, view, rgb, depth, None, perception.query_xy)
 
 
 def _ooal_grasp_point(scene, say, affordance: str | None) -> np.ndarray | None:

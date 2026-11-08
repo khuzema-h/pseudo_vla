@@ -38,6 +38,25 @@ class _FakeTracker:
         self.calls.append(kwargs)
 
 
+class _StepTracker:
+    """Online stand-in: the first call only initializes, later calls mark the window length."""
+
+    step = 2
+
+    def __init__(self):
+        self.steps = []
+
+    def __call__(self, video_chunk=None, is_first_step=False, **kwargs):
+        self.steps.append({"is_first_step": is_first_step, "frames": int(video_chunk.shape[1])})
+        if is_first_step:
+            return None, None
+        count = int(video_chunk.shape[1])
+        tracks = perception.torch.zeros((1, count, 4, 2))
+        tracks[..., 0] = count
+        visible = perception.torch.ones((1, count, 4), dtype=perception.torch.bool)
+        return tracks, visible
+
+
 def _complete_action_with_callbacks(*args):
     authorize_event = args[10]
     for stage in ("approach", "grasp", "lift", "place", "verify_placement"):
@@ -68,42 +87,77 @@ class StackingPerceptionTests(unittest.TestCase):
         with patch.object(perception.torch.Tensor, "cuda", lambda tensor: tensor):
             points = instance.segment_groups(image, prompts, count_per_group=4)
 
-        self.assertEqual(list(points), ["support", "moving"])
-        self.assertEqual(instance.query_groups["support"], slice(0, 4))
-        self.assertEqual(instance.query_groups["moving"], slice(4, 8))
-        self.assertEqual(instance.queries.shape, (1, 8, 3))
-        self.assertEqual(len(instance.tracker.calls), 1)
-        self.assertTrue(np.all(instance.mask[4:28, 4:28]))
-        self.assertTrue(np.all(instance.mask[36:60, 36:60]))
+            self.assertEqual(list(points), ["support", "moving"])
+            self.assertEqual(instance.query_groups["support"], slice(0, 4))
+            self.assertEqual(instance.query_groups["moving"], slice(4, 8))
+            self.assertEqual(instance.queries.shape, (1, 8, 3))
+            self.assertEqual(len(instance.tracker.calls), 1)
+            self.assertTrue(np.all(instance.mask[4:28, 4:28]))
+            self.assertTrue(np.all(instance.mask[36:60, 36:60]))
 
-        tracks = np.arange(16, dtype=np.float32).reshape(8, 2)
-        visible = np.ones(8, dtype=bool)
-        moving_tracks, moving_visible = instance.track_group(tracks, visible, "moving")
-        np.testing.assert_array_equal(moving_tracks, tracks[4:8])
-        np.testing.assert_array_equal(moving_visible, visible[4:8])
+            tracks = np.arange(16, dtype=np.float32).reshape(8, 2)
+            visible = np.ones(8, dtype=bool)
+            moving_tracks, moving_visible = instance.track_group(tracks, visible, "moving")
+            np.testing.assert_array_equal(moving_tracks, tracks[4:8])
+            np.testing.assert_array_equal(moving_visible, visible[4:8])
 
-        instance.retain_groups(image, ("moving",), count_per_group=4)
-        self.assertEqual(instance.query_groups, {"moving": slice(0, 4)})
-        self.assertEqual(instance.queries.shape, (1, 4, 3))
-        self.assertEqual(len(instance.tracker.calls), 2)
-        self.assertEqual(set(instance.group_masks), {"support", "moving"})
-        self.assertFalse(np.any(instance.mask[4:28, 4:28]))
-        self.assertTrue(np.all(instance.mask[36:60, 36:60]))
+            instance.retain_groups(image, ("moving",), count_per_group=4)
+            self.assertEqual(instance.query_groups, {"moving": slice(0, 4)})
+            self.assertEqual(instance.queries.shape, (1, 4, 3))
+            self.assertEqual(len(instance.tracker.calls), 2)
+            self.assertEqual(set(instance.group_masks), {"support", "moving"})
+            self.assertFalse(np.any(instance.mask[4:28, 4:28]))
+            self.assertTrue(np.all(instance.mask[36:60, 36:60]))
 
-        instance.retain_groups(image, ("support",), count_per_group=4)
-        self.assertEqual(instance.query_groups, {"support": slice(0, 4)})
-        self.assertEqual(instance.queries.shape, (1, 4, 3))
-        self.assertEqual(len(instance.tracker.calls), 3)
-        self.assertTrue(np.all(instance.mask[4:28, 4:28]))
-        self.assertFalse(np.any(instance.mask[36:60, 36:60]))
+            instance.retain_groups(image, ("support",), count_per_group=4)
+            self.assertEqual(instance.query_groups, {"support": slice(0, 4)})
+            self.assertEqual(instance.queries.shape, (1, 4, 3))
+            self.assertEqual(len(instance.tracker.calls), 3)
+            self.assertTrue(np.all(instance.mask[4:28, 4:28]))
+            self.assertFalse(np.any(instance.mask[36:60, 36:60]))
 
-        instance.segment_groups(image, {"support": ((50.0, 10.0), None)}, count_per_group=4)
-        self.assertEqual(instance.query_groups, {"support": slice(0, 4)})
-        self.assertEqual(instance.queries.shape, (1, 4, 3))
-        self.assertEqual(set(instance.group_masks), {"support"})
-        self.assertTrue(np.any(instance.mask[6:15, 46:55]))
-        self.assertFalse(np.any(instance.mask[4:28, 4:28]))
-        self.assertFalse(np.any(instance.mask[36:60, 36:60]))
+            instance.segment_groups(image, {"support": ((50.0, 10.0), None)}, count_per_group=4)
+            self.assertEqual(instance.query_groups, {"support": slice(0, 4)})
+            self.assertEqual(instance.queries.shape, (1, 4, 3))
+            self.assertEqual(set(instance.group_masks), {"support"})
+            self.assertTrue(np.any(instance.mask[6:15, 46:55]))
+            self.assertFalse(np.any(instance.mask[4:28, 4:28]))
+            self.assertFalse(np.any(instance.mask[36:60, 36:60]))
+
+    def test_tracker_keeps_the_latest_points_between_windows(self):
+        instance = perception.Perception.__new__(perception.Perception)
+        instance.sam = _FakeSam()
+        instance.tracker = _StepTracker()
+        instance.frames = []
+        instance.queries = None
+        instance.query_groups = {}
+        instance._window_start = 0
+        instance.mask = None
+        instance.query_xy = None
+        instance.tracks_xy = None
+        instance.tracks_visible = None
+        instance.group_masks = {}
+        instance._ensure_sam = lambda: None
+        image = np.zeros((64, 64, 3), dtype=np.uint8)
+
+        with patch.object(perception.torch.Tensor, "cuda", lambda tensor: tensor):
+            instance.segment_groups(
+                image,
+                {"moving": (None, (36, 36, 60, 60))},
+                count_per_group=4,
+            )
+            instance.release_sam()
+            first = instance.push_frame(image)
+            second = instance.push_frame(image)
+            updated = instance.push_frame(image)
+
+        self.assertIsNone(instance.sam)
+        self.assertIsNone(instance.mask)
+        self.assertEqual([step["is_first_step"] for step in instance.tracker.steps], [True, False])
+        np.testing.assert_array_equal(first[0], instance.query_xy)
+        np.testing.assert_array_equal(second[0], instance.query_xy)
+        self.assertTrue(np.all(updated[0][:, 0] == instance.tracker.step * 2))
+        np.testing.assert_array_equal(instance.latest_tracks()[0], updated[0])
 
     def test_replace_group_points_keeps_the_other_group(self):
         instance = perception.Perception.__new__(perception.Perception)
@@ -442,6 +496,229 @@ class StackingPerceptionTests(unittest.TestCase):
         np.testing.assert_allclose(place.quaternion, grasp_quaternion / np.linalg.norm(grasp_quaternion))
         np.testing.assert_allclose(preplace.quaternion, place.quaternion)
 
+    def test_collision_bounds_lower_the_mug_with_a_five_centimeter_buffer(self):
+        preplace = perception.ApproachGoal(
+            position=np.array([-0.25, -0.24, 1.316]),
+            quaternion=np.array([1.0, 0.0, 0.0, 0.0]),
+            center_world=np.array([-0.34, -0.24, 0.95]),
+            top_z=0.916,
+        )
+        scene = SimpleNamespace(
+            base_path="/base",
+            object_paths={"mug": "/World/mug", "plate": "/World/plate"},
+        )
+
+        def bounds(path):
+            if path.endswith("mug"):
+                return np.array([-0.08, -0.32, 1.20]), np.array([0.02, -0.22, 1.29])
+            return np.array([-0.44, -0.34, 0.900]), np.array([-0.24, -0.14, 0.916])
+
+        messages = []
+        from pseudo_vla.scene import select_scene
+
+        select_scene("kitchen")
+        try:
+            with (
+                patch("pseudo_vla.scene.world_collision_bounds", side_effect=bounds),
+                patch(
+                    "pseudo_vla.perception.prim_world_pose",
+                    return_value=(np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])),
+                ),
+                patch("pseudo_vla.perception.world_to_base", side_effect=lambda points, *_: points),
+                patch("pseudo_vla.perception.base_to_world", side_effect=lambda points, *_: points),
+            ):
+                goal = track_and_servo._place_goal_for_collision_gap(
+                    scene, "mug", "plate", preplace, messages.append
+                )
+        finally:
+            select_scene("blocks")
+
+        np.testing.assert_allclose(goal.position, [-0.25, -0.24, 1.316 - (0.284 - 0.05)])
+        self.assertIn("collision bottom 1.200", messages[0])
+        self.assertIn("collision top 0.916", messages[0])
+        self.assertIn("lowering 0.234 m", messages[-1])
+        self.assertIn("0.05 m above the plate", messages[-1])
+
+    def test_mug_release_descends_by_the_mask_gap(self):
+        preplace = perception.ApproachGoal(
+            position=np.array([-0.25, -0.24, 1.316]),
+            quaternion=np.array([1.0, 0.0, 0.0, 0.0]),
+            center_world=np.array([-0.34, -0.24, 0.95]),
+            top_z=0.916,
+        )
+        boxes = []
+
+        def segment(_rgb, box=None, point=None):
+            boxes.append(box)
+            return np.ones((8, 8), dtype=bool)
+
+        perception_instance = SimpleNamespace(
+            ground_all=lambda _rgb, phrases: {
+                "mug": ((1.0, 2.0, 3.0, 4.0), 0.8),
+                "dinner plate": ((5.0, 6.0, 7.0, 8.0), 0.7),
+            },
+            segment_region=segment,
+        )
+        messages = []
+        from pseudo_vla.scene import select_scene
+
+        select_scene("kitchen")
+        try:
+            with (
+                patch(
+                    "pseudo_vla.perception.prim_world_pose",
+                    return_value=(np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])),
+                ),
+                patch("pseudo_vla.perception.world_to_base", side_effect=lambda points, *_: points),
+                patch("pseudo_vla.perception.base_to_world", side_effect=lambda points, *_: points),
+                patch("pseudo_vla.geometry.descent_between_masks", return_value=0.22),
+            ):
+                goal = track_and_servo._place_goal_for_mask_gap(
+                    perception_instance,
+                    np.zeros((8, 8, 3), dtype=np.uint8),
+                    np.ones((8, 8)),
+                    {},
+                    "/cam",
+                    "/base",
+                    "mug",
+                    "plate",
+                    preplace,
+                    messages.append,
+                )
+        finally:
+            select_scene("blocks")
+
+        np.testing.assert_allclose(goal.position, [-0.25, -0.24, 1.146])
+        np.testing.assert_allclose(goal.quaternion, preplace.quaternion)
+        self.assertEqual(boxes, [(1.0, 2.0, 3.0, 4.0), (5.0, 6.0, 7.0, 8.0)])
+        self.assertIn("0.220", messages[-1])
+        self.assertIn("lowering 0.170 m", messages[-1])
+        self.assertIn("0.05 m above the plate", messages[-1])
+
+    def test_tracked_points_set_the_release_without_sam(self):
+        preplace = perception.ApproachGoal(
+            position=np.array([-0.25, -0.24, 1.316]),
+            quaternion=np.array([1.0, 0.0, 0.0, 0.0]),
+            center_world=np.array([-0.34, -0.24, 0.95]),
+            top_z=0.916,
+        )
+        calls = []
+        perception_instance = SimpleNamespace(
+            query_groups={"moving": slice(0, 4), "support": slice(4, 8)},
+            latest_tracks=lambda: (np.zeros((8, 2), np.float32), np.ones(8, dtype=bool)),
+            tracked_group_points=lambda name, *_args, **_kwargs: (
+                np.tile([0.0, 0.0, 1.20], (4, 1))
+                if name == "moving"
+                else np.tile([0.0, 0.0, 0.90], (4, 1))
+            ),
+            segment_region=lambda *_args, **_kwargs: calls.append("sam"),
+        )
+        with (
+            patch(
+                "pseudo_vla.perception.prim_world_pose",
+                return_value=(np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])),
+            ),
+            patch("pseudo_vla.perception.world_to_base", side_effect=lambda points, *_: points),
+            patch("pseudo_vla.perception.base_to_world", side_effect=lambda points, *_: points),
+        ):
+            goal = track_and_servo._place_goal_for_mask_gap(
+                perception_instance,
+                np.zeros((8, 8, 3), dtype=np.uint8),
+                np.ones((8, 8)),
+                {},
+                "/cam",
+                "/base",
+                "mug",
+                "plate",
+                preplace,
+                lambda _message: None,
+            )
+
+        self.assertEqual(calls, [])
+        np.testing.assert_allclose(goal.position, [-0.25, -0.24, 1.066])
+
+    def test_unusable_mask_gap_keeps_the_geometric_place(self):
+        preplace = perception.ApproachGoal(
+            position=np.array([-0.25, -0.24, 1.316]),
+            quaternion=np.array([1.0, 0.0, 0.0, 0.0]),
+            center_world=np.array([-0.34, -0.24, 0.95]),
+            top_z=0.916,
+        )
+        perception_instance = SimpleNamespace(
+            ground_all=lambda _rgb, _phrases: {
+                "mug": ((0.0, 0.0, 4.0, 4.0), 0.8),
+                "dinner plate": ((0.0, 4.0, 4.0, 8.0), 0.7),
+            },
+            segment_region=lambda _rgb, box=None, point=None: np.ones((8, 8), dtype=bool),
+        )
+        messages = []
+        from pseudo_vla.scene import select_scene
+
+        select_scene("kitchen")
+        try:
+            with patch("pseudo_vla.geometry.descent_between_masks", return_value=0.0):
+                goal = track_and_servo._place_goal_for_mask_gap(
+                    perception_instance,
+                    np.zeros((8, 8, 3), dtype=np.uint8),
+                    np.ones((8, 8)),
+                    {},
+                    "/cam",
+                    "/base",
+                    "mug",
+                    "plate",
+                    preplace,
+                    messages.append,
+                )
+        finally:
+            select_scene("blocks")
+
+        self.assertIsNone(goal)
+        self.assertIn("keeping the geometric place height", messages[-1])
+
+    def test_mask_gap_inside_the_plate_buffer_releases_at_the_hover(self):
+        preplace = perception.ApproachGoal(
+            position=np.array([-0.25, -0.24, 1.316]),
+            quaternion=np.array([1.0, 0.0, 0.0, 0.0]),
+            center_world=np.array([-0.34, -0.24, 0.95]),
+            top_z=0.916,
+        )
+        perception_instance = SimpleNamespace(
+            ground_all=lambda _rgb, _phrases: {
+                "mug": ((0.0, 0.0, 4.0, 4.0), 0.8),
+                "dinner plate": ((0.0, 4.0, 4.0, 8.0), 0.7),
+            },
+            segment_region=lambda _rgb, box=None, point=None: np.ones((8, 8), dtype=bool),
+        )
+        from pseudo_vla.scene import select_scene
+
+        select_scene("kitchen")
+        try:
+            with (
+                patch(
+                    "pseudo_vla.perception.prim_world_pose",
+                    return_value=(np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])),
+                ),
+                patch("pseudo_vla.perception.world_to_base", side_effect=lambda points, *_: points),
+                patch("pseudo_vla.perception.base_to_world", side_effect=lambda points, *_: points),
+                patch("pseudo_vla.geometry.descent_between_masks", return_value=0.03),
+            ):
+                goal = track_and_servo._place_goal_for_mask_gap(
+                    perception_instance,
+                    np.zeros((8, 8, 3), dtype=np.uint8),
+                    np.ones((8, 8)),
+                    {},
+                    "/cam",
+                    "/base",
+                    "mug",
+                    "plate",
+                    preplace,
+                    lambda _message: None,
+                )
+        finally:
+            select_scene("blocks")
+
+        np.testing.assert_allclose(goal.position, preplace.position)
+
     def test_blocked_descent_releases_instead_of_planning_lower(self):
         hand = np.array([-0.25, -0.24, 1.04])
         goal = np.array([-0.25, -0.24, 1.00])
@@ -728,7 +1005,8 @@ class StackingPerceptionTests(unittest.TestCase):
         perception_instance = SimpleNamespace(
             mask=np.ones((32, 32), dtype=bool),
             query_xy=np.array([[16.0, 16.0]], dtype=np.float32),
-            segment_groups=lambda frame, prompts: self.assertEqual(set(prompts), {"green"})
+            segment_groups=lambda frame, prompts: self.assertEqual(set(prompts), {"green"}),
+            release_sam=lambda: None,
         )
         say = unittest.mock.Mock()
         view = SimpleNamespace(update=lambda *args, **kwargs: None)

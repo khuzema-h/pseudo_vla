@@ -60,6 +60,8 @@ class Perception:
         self._window_start = 0
         self.mask: np.ndarray | None = None
         self.query_xy: np.ndarray | None = None
+        self.tracks_xy: np.ndarray | None = None
+        self.tracks_visible: np.ndarray | None = None
         self.group_masks: dict[str, np.ndarray] = {}
         self.grounder = ObjectGrounder()
         self.grounder.load()
@@ -74,6 +76,17 @@ class Perception:
 
         self._sam_model = build_sam2(SAM_CONFIG, str(SAM_CHECKPOINT), device="cuda")
         self.sam = SAM2ImagePredictor(self._sam_model)
+
+    def release_sam(self) -> None:
+        """Drop SAM once CoTracker has query points. Tracking does not use it again."""
+        self.sam = None
+        self._sam_model = None
+        self.mask = None
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            return
 
     def ground(self, rgb: np.ndarray, text: str) -> tuple[tuple[float, float, float, float], float] | None:
         """Turn a free-text prompt into the best box on this image."""
@@ -126,7 +139,8 @@ class Perception:
                 raise RuntimeError("SAM 2 returned an empty mask")
             return mask
         finally:
-            self.sam.reset_predictor()
+            if self.sam is not None:
+                self.sam.reset_predictor()
 
     def segment_groups(
         self,
@@ -173,7 +187,8 @@ class Perception:
             self._seed_tracker(image, group_points)
             return group_points
         finally:
-            self.sam.reset_predictor()
+            if self.sam is not None:
+                self.sam.reset_predictor()
 
     def retain_groups(self, rgb: np.ndarray, names: tuple[str, ...], count_per_group: int = 16) -> None:
         """Reseed CoTracker on selected cached masks, dropping other groups' query points."""
@@ -230,6 +245,8 @@ class Perception:
         self.mask = np.logical_or.reduce([self.group_masks[name] for name in group_points])
         queries = np.concatenate(query_chunks, axis=0)
         self.queries = torch.from_numpy(queries).unsqueeze(0).cuda()
+        self.tracks_xy = self.query_xy.copy()
+        self.tracks_visible = np.ones(len(self.query_xy), dtype=bool)
         self.tracker(
             video_chunk=_rgb_tensor(image),
             is_first_step=True,
@@ -246,6 +263,12 @@ class Perception:
         group = self.query_groups[name]
         return tracks_xy[group], visible[group]
 
+    def latest_tracks(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """Most recent CoTracker points, including the seed until the next window."""
+        if self.tracks_xy is None or self.tracks_visible is None:
+            return None
+        return self.tracks_xy, self.tracks_visible
+
     def push_frame(self, rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
         if self.queries is None:
             return None
@@ -254,17 +277,15 @@ class Perception:
             image = np.clip(image, 0, 255).astype(np.uint8)
         self.frames.append(image)
         window = self.tracker.step * 2
-        end = self._window_start + window
-        if end > len(self.frames):
-            return None
-        chunk = np.stack(self.frames[self._window_start : end], axis=0)
-        tracks, visible = self.tracker(video_chunk=_rgb_tensor(chunk), add_support_grid=True)
-        self._window_start += self.tracker.step
-        self.frames = self.frames[self._window_start :]
-        self._window_start = 0
-        tracks_np = tracks[0, -1].detach().cpu().numpy()
-        visible_np = visible[0, -1].detach().cpu().numpy().astype(bool)
-        return tracks_np, visible_np
+        if len(self.frames) >= window:
+            chunk = np.stack(self.frames[:window], axis=0)
+            tracks, visible = self.tracker(video_chunk=_rgb_tensor(chunk), add_support_grid=True)
+            self.frames = self.frames[self.tracker.step :]
+            self._window_start = 0
+            if tracks is not None:
+                self.tracks_xy = tracks[0, -1].detach().cpu().numpy()
+                self.tracks_visible = visible[0, -1].detach().cpu().numpy().astype(bool)
+        return self.latest_tracks()
 
     def approach_goal(
         self,
@@ -403,5 +424,8 @@ def _rgb_tensor(rgb: np.ndarray) -> torch.Tensor:
     array = np.asarray(rgb)
     if array.ndim == 3:
         array = array[None, ...]
-    tensor = torch.from_numpy(np.ascontiguousarray(array)).permute(0, 3, 1, 2).float().cuda()
+    array = np.ascontiguousarray(array)
+    if np.issubdtype(array.dtype, np.floating) and array.size and float(np.nanmax(array)) <= 1.0:
+        array = array * 255.0
+    tensor = torch.from_numpy(array).permute(0, 3, 1, 2).float().cuda()
     return tensor.unsqueeze(0)

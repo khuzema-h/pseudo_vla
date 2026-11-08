@@ -400,6 +400,41 @@ def object_dims(spec: dict) -> np.ndarray:
     return np.asarray(spec["dims"], dtype=np.float64)
 
 
+def world_collision_bounds(path: str) -> tuple[np.ndarray, np.ndarray]:
+    """Current world-aligned min and max of a prim's collision geometry."""
+    import omni.timeline
+    import omni.usd
+    from pxr import Usd, UsdGeom, UsdPhysics
+
+    stage = omni.usd.get_context().get_stage()
+    root = stage.GetPrimAtPath(path)
+    if not root.IsValid():
+        raise RuntimeError(f"Missing prim {path}")
+    timeline = omni.timeline.get_timeline_interface()
+    time_code = Usd.TimeCode(timeline.get_current_time() * stage.GetTimeCodesPerSecond())
+    cache = UsdGeom.BBoxCache(time_code, ["default", "render"])
+    boxes = []
+    for prim in Usd.PrimRange(root):
+        if not prim.HasAPI(UsdPhysics.CollisionAPI):
+            continue
+        aligned = cache.ComputeWorldBound(prim).ComputeAlignedBox()
+        if aligned.IsEmpty():
+            continue
+        boxes.append(aligned)
+    if not boxes:
+        aligned = cache.ComputeWorldBound(root).ComputeAlignedBox()
+        if aligned.IsEmpty():
+            raise RuntimeError(f"No collision bounds for {path}")
+        boxes = [aligned]
+    minimum = np.min([_range_point(box.GetMin()) for box in boxes], axis=0)
+    maximum = np.max([_range_point(box.GetMax()) for box in boxes], axis=0)
+    return minimum, maximum
+
+
+def _range_point(point) -> np.ndarray:
+    return np.array([float(point[0]), float(point[1]), float(point[2])], dtype=np.float64)
+
+
 def _record_prop_bounds(spec: dict) -> None:
     """Store the prop's world-aligned center and size for the cuRobo cuboid."""
     import omni.usd

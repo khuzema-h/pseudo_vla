@@ -142,7 +142,7 @@ def settle_tracker(
         scene.step()
         rgb, depth, _ = scene.read_sensors()
         perception.retain_groups(rgb, retain_groups)
-        update_camera_views(scene, view, rgb, depth, perception.mask, perception.query_xy)
+        update_camera_views(scene, view, rgb, depth, None, perception.query_xy)
         steps -= 1
     for _ in range(max(steps, 0)):
         scene.step()
@@ -187,7 +187,7 @@ def update_tracker(scene, perception, rgb: np.ndarray, depth: np.ndarray, view) 
     if view is None:
         return
     if tracked is None:
-        update_camera_views(scene, view, rgb, depth, perception.mask, perception.query_xy)
+        update_camera_views(scene, view, rgb, depth, None, getattr(perception, "query_xy", None))
     else:
         points, visible = tracked
         update_camera_views(scene, view, rgb, depth, None, points, visible)

@@ -290,6 +290,69 @@ def pose_from_depth_points(points: np.ndarray) -> tuple[np.ndarray, float, np.nd
     return center, top_z, dims
 
 
+def collision_vertical_gap(
+    moving_min: np.ndarray,
+    moving_max: np.ndarray,
+    support_min: np.ndarray,
+    support_max: np.ndarray,
+) -> float:
+    """Meters from the bottom of a collision box to the top of the support box."""
+    moving_low = np.asarray(moving_min, dtype=np.float64).reshape(3)
+    moving_high = np.asarray(moving_max, dtype=np.float64).reshape(3)
+    support_low = np.asarray(support_min, dtype=np.float64).reshape(3)
+    support_high = np.asarray(support_max, dtype=np.float64).reshape(3)
+    if np.any(moving_high < moving_low) or np.any(support_high < support_low):
+        raise ValueError("Collision bounds are inverted")
+    return float(moving_low[2] - support_high[2])
+
+
+def descent_between_points(moving_points: np.ndarray, support_points: np.ndarray) -> float:
+    """Vertical gap from the bottom of a moving object to the top of its support.
+
+    A positive result is how far the object must descend before it meets the support.
+    """
+    moving = _finite_xyz(moving_points)
+    support = _finite_xyz(support_points)
+    if moving.shape[0] < 4 or support.shape[0] < 4:
+        raise ValueError("Mask depth needs at least 4 points on the moving object and the support")
+    moving_bottom = float(np.percentile(moving[:, 2], 5))
+    return moving_bottom - tracked_surface_top(support)
+
+
+def descent_between_masks(
+    moving_mask: np.ndarray,
+    support_mask: np.ndarray,
+    depth: np.ndarray,
+    camera_params: dict,
+    camera_path: str,
+) -> float:
+    """Meters to lower the moving object until its mask meets the support mask."""
+    moving = _exclusive_mask(moving_mask, support_mask)
+    support = _exclusive_mask(support_mask, moving_mask)
+    moving_points = mask_depth_points(moving, depth, camera_params, camera_path)
+    support_points = mask_depth_points(support, depth, camera_params, camera_path)
+    return descent_between_points(moving_points, support_points)
+
+
+def _exclusive_mask(mask: np.ndarray, other: np.ndarray) -> np.ndarray:
+    """Drop pixels shared with the other object, unless that would erase the mask."""
+    region = np.asarray(mask, dtype=bool)
+    overlap = np.asarray(other, dtype=bool)
+    if region.shape != overlap.shape:
+        raise ValueError(f"Mask shape {region.shape} does not match {overlap.shape}")
+    only = region & ~overlap
+    if int(only.sum()) >= 16:
+        return only
+    return region
+
+
+def _finite_xyz(points: np.ndarray) -> np.ndarray:
+    cloud = np.asarray(points, dtype=np.float64)
+    if cloud.ndim != 2 or cloud.shape[1] != 3:
+        raise ValueError("Points must be an Nx3 array")
+    return cloud[np.isfinite(cloud).all(axis=1)]
+
+
 def tracked_surface_top(points: np.ndarray) -> float:
     """Estimate the top of a tracked surface while rejecting isolated depth outliers."""
     if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] == 0:

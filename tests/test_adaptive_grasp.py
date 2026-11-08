@@ -1,4 +1,6 @@
 import unittest
+from unittest.mock import patch
+
 import numpy as np
 
 from pseudo_vla.geometry import (
@@ -7,6 +9,9 @@ from pseudo_vla.geometry import (
     adaptive_grasp_orientation,
     base_to_world,
     base_to_world_quat,
+    collision_vertical_gap,
+    descent_between_masks,
+    descent_between_points,
     handle_pinch_target,
     side_grasp_placement_world,
     slide_grasp_toward_handle,
@@ -14,6 +19,7 @@ from pseudo_vla.geometry import (
     quat_inverse,
     quat_multiply,
     quat_to_matrix,
+    tracked_surface_top,
     world_to_base,
     world_to_base_quat,
 )
@@ -172,6 +178,61 @@ class TestAdaptiveGrasp(unittest.TestCase):
         np.testing.assert_allclose(preplace, [-0.25, -0.24, 1.316])
         np.testing.assert_allclose(moved[:2], [-0.34, -0.24])
         self.assertAlmostEqual(moved[2] - center[2], place[2] - hand[2])
+
+    def test_collision_gap_is_the_mug_bottom_above_the_plate_top(self):
+        gap = collision_vertical_gap(
+            np.array([-0.08, -0.32, 1.20]),
+            np.array([0.02, -0.22, 1.29]),
+            np.array([-0.44, -0.34, 0.900]),
+            np.array([-0.24, -0.14, 0.916]),
+        )
+
+        self.assertAlmostEqual(gap, 1.20 - 0.916)
+
+    def test_mask_gap_is_the_mug_bottom_above_the_plate(self):
+        moving = np.array(
+            [
+                [0.0, 0.0, 1.20],
+                [0.01, 0.0, 1.22],
+                [0.0, 0.01, 1.24],
+                [0.01, 0.01, 1.30],
+            ]
+        )
+        support = np.array(
+            [
+                [0.0, 0.0, 0.90],
+                [0.02, 0.0, 0.91],
+                [0.0, 0.02, 0.90],
+                [0.02, 0.02, 0.91],
+            ]
+        )
+
+        gap = descent_between_points(moving, support)
+
+        self.assertAlmostEqual(gap, float(np.percentile(moving[:, 2], 5)) - tracked_surface_top(support))
+        self.assertGreater(gap, 0.25)
+
+    def test_mask_gap_drops_pixels_shared_by_the_mug_and_plate(self):
+        moving = np.zeros((20, 20), dtype=bool)
+        support = np.zeros((20, 20), dtype=bool)
+        moving[2:10, 2:10] = True
+        support[6:16, 6:16] = True
+        seen = []
+
+        def fake_points(mask, _depth, _camera_params, _camera_path, count=64):
+            seen.append(mask.copy())
+            if mask[3, 3]:
+                return np.tile(np.array([[0.0, 0.0, 1.20]]), (4, 1))
+            return np.tile(np.array([[0.0, 0.0, 0.90]]), (4, 1))
+
+        with patch("pseudo_vla.geometry.mask_depth_points", side_effect=fake_points):
+            gap = descent_between_masks(moving, support, np.ones((20, 20)), {}, "/cam")
+
+        self.assertAlmostEqual(gap, 0.30)
+        self.assertTrue(seen[0][3, 3])
+        self.assertFalse(seen[0][7, 7])
+        self.assertTrue(seen[1][12, 12])
+        self.assertFalse(seen[1][7, 7])
 
 
 if __name__ == "__main__":
