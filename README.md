@@ -1,104 +1,81 @@
 # pseudo-vla
 
-A single-process Isaac Sim controller that turns a natural-language pick-and-place instruction into a validated plan, then tracks the objects and moves a Franka arm.
+The purpose of this project is to develop a zero-shot system that lets you prompt a robot in natural language and complete the requested task, without task-specific training or fine-tuning for each instruction.
 
-Local [Tev1](https://ollama.com) (`tev1:4b`) chooses among options in `config/tev1_questions.json`. Python checks every choice against the current scene before anything moves. Perception finds the objects, and [cuRobo](https://nvlabs.github.io/curobo) 0.8 plans the arm. Tev1 never names a Python function and never sends joint targets.
+It is a single-process Isaac Sim controller for a Franka arm. A prompt becomes a validated skill plan, perception tracks the objects, and [cuRobo](https://nvlabs.github.io/curobo) moves the arm. Local [Tev1](https://ollama.com) (`tev1:4b`) only chooses among options that Python computed from the live scene and the skill registry. It never names a Python function and never sends joint targets. Perception, grasp affordances, and motion stay behind thin adapters.
 
-This stack was brought up on an RTX 3080 Laptop (16 GB) with Python 3.12 and Torch `2.6.0+cu124`. Leave Torch on that build. Isaac Sim 6.2's own pin is newer, and upgrading Torch breaks this stack.
+Pin Torch to `2.6.0+cu124`. Isaac Sim 6.2's own pin is newer, and upgrading Torch breaks this stack.
 
-## Current state
-
-Interactive instructions go through Tev1. The model is asked only the questions that match the current decision, then the scene state is refreshed after each completed stage.
-
-A plan is either `find`, or an ordered list of moves. Each destination is `at`, `on`, `left_of`, `right_of`, or `inside`. Object, location, and container ids come from the live scene. A plan that names anything else is rejected before the arm moves.
-
-Two scenes are available:
-
-- **blocks** (default). Isaac Sim's simple room. The Franka stands on the near edge of the table, facing +Y. Three 5 cm dynamic cubes sit in front of it: `red`, `green`, and `blue`. The work-surface location is `table`. There are no containers, so `inside` is rejected until a container, its collision geometry, and a placement behavior exist.
-- **kitchen** (`--scene kitchen`). A counter with a dinner plate and a mug. The work-surface location is `counter`. `--stack-prompt` is not supported here.
-
-What is in place:
-
-- Tev1 selects the task, the objects and destinations that the scene lists, an OOAL grasp affordance, and whether the next validated stage proceeds or stops.
-- The controller and cuRobo keep collision-aware motion and physical safety.
-- Unit tests mock Ollama. They cover the Tev1 client, adaptive task decisions, task-plan validation, affordances, stacking compatibility, the kitchen scene, and perception helpers.
-
-What is not established yet:
-
-- Live Isaac Sim grasp, contact, unstacking, relative placement, and task completion have not been validated end to end. Passing unit tests do not mean a physical run succeeded.
-
-## How a request is handled
+## Flow
 
 ```mermaid
 flowchart TD
-    U[User instruction] --> C{Control or task?}
-    C -->|home / quit| R[Controller]
-    C -->|Natural language| T[Tev1 chooses a task and scene options]
-    T --> V[Python validates objects, destinations, and order]
-    V -->|Invalid| E[Report the error and do not move]
-    V -->|Valid plan| D[Tev1 authorizes the next stage]
-    D --> F[Find: OWL-ViT, SAM 2, CoTracker, RGB-D]
-    F --> A[Approach: tracked pose and wrist RGB-D]
-    A --> G[Grasp and lift: controller and cuRobo]
-    G --> P[Place: at, on, left_of, right_of, or inside]
-    P --> D
-    G -->|Motion or grasp failure| E
-    D -->|Stop or model failure| E
-    P -->|Plan complete| R
+    U[Instruction] --> I[Tev1: task_intent]
+    I -->|find| F[find_target]
+    I -->|pick_place| P[plan_more then moving_object / destination]
+    I -->|skill_sequence| S[plan_more then skill_next and slots]
+    F --> V[Validate against the scene]
+    P --> V
+    S --> W[Symbolic world check and prerequisite repair]
+    W --> V
+    V -->|Invalid or unsupported| E[Stop]
+    V -->|Valid plan| A[Authorize the next phase]
+    A --> X[Perception and motion]
+    X --> A
+    A -->|stop or failure| E
 ```
 
-Tev1 talks to Ollama at `POST /v1/systemone`. The client is `pseudo_vla/tev1_client.py`. It loads `config/tev1_questions.json`, sends the current state plus only the questions for this step, and checks the typed answer before anyone uses it.
+1. **Route.** `task_intent` picks `find`, `pick_place`, `skill_sequence`, or `unsupported`.
+2. **Plan.** `find` names one listed object. `pick_place` fills one or more moves with the scene catalog. `skill_sequence` fills registered skills one slot at a time (`skill_next`, then each skill's slots). A slot with a single real option is filled without a Tev1 call. Every choice list includes `none` or `unsupported`.
+3. **Check.** Each step is checked against a symbolic world (`held`, `on`, `inside`, `opened`). A blocked step may insert an automatic repair (park the held object, clear the one blocker, open the closed container) or ask Tev1 when more than one repair is legal.
+4. **Authorize.** Before each phase, Tev1 may proceed with the expected phase, take one recovery from a fixed failure table, or stop. Retry caps live in code.
+5. **Execute.** OWL-ViT grounds text, SAM 2 seeds CoTracker and is then released, CoTracker tracks through the motion, OOAL can narrow a grasp region, and cuRobo plans collision-aware trajectories.
 
-The bank allows at most 64 questions. Each call uses a subset. Question types:
+Registered skills include pick, place, open, close, push, press, rotate, insert, extract, stack, unstack, pour, use_tool, hang, wait, go_home, repeat, and ask_clarification. `pick_place`, `stack`, and `unstack` are stored as pick then place.
 
-| Type | What Tev1 returns | How it is used |
-| --- | --- | --- |
-| `choice` | One option, with probabilities | Task, object, destination, stack event, affordance. 2–24 options. |
-| `noul` | A probability for a yes/no question | Whether another pick-and-place action was requested. `0.5` is treated as undecided and stops the plan. |
-| `score` | A level on an ordered rubric | How well a selected affordance matches the instruction. |
+Tev1 talks to Ollama at `POST /v1/systemone` through `pseudo_vla/tev1_client.py`. Questions live in `config/tev1_questions.json`. Set `OLLAMA_HOST` to override `http://localhost:11434`. Set `TEV1_CALL_LOG` to a file path to append each call as JSONL. The client timeout is 120 seconds.
 
-Choice options that depend on the scene, such as which block to move, are filled in from the current catalog. The JSON file stores the question text. It does not store a fixed list of blocks.
+## Scenes
 
-Routing lives in `pseudo_vla/task_llm.py`:
+| Scene | Surface | Objects | Notes |
+| --- | --- | --- | --- |
+| `blocks` (default) | `table` | `red`, `green`, `blue` | Franka faces +Y. Left is world −X, right is world +X. |
+| `kitchen` | `counter` | `plate`, `mug` | Side grasp for hold-style mug moves. `--stack-prompt` is rejected. |
 
-1. `task_intent` — `find`, `pick_place`, or `unsupported`.
-2. For `find`, `find_target` picks one listed object.
-3. For `pick_place`, `plan_more` asks whether another requested move remains. Each move then asks `moving_object`, `destination_kind`, and, when several targets exist, `destination_target`. At most six actions.
-4. `validate_task_plan` in `pseudo_vla/task_plan.py` checks ids, destination kinds, self-placement, and support cycles.
-5. `pseudo_vla/task_workflow.py` asks `task_event` before find, plan, approach, grasp, lift, place, and placement verification. The only legal answers are the expected event or `stop`.
-
-`pseudo_vla/stacking_llm.py` is the block-scene path on top of that router. `--stack-prompt` asks `stack_base` and `stack_next` for a full red/green/blue order before Isaac Sim starts. During that run, `stack_event` authorizes each pair. A free-text stack such as `stack blue on red` goes through the general task router, then the same physical stacking phase.
-
-Grasp regions use the same client. `pseudo_vla/affordance.py` asks `affordance_family`, `affordance_label`, and `affordance_fit` against OOAL's seen classes. `none`, or a weak fit, keeps the full SAM mask. A model error stops before motion. Those labels are grasp options, not robot tasks.
-
-A timeout, HTTP error, malformed answer, unknown id, or `stop` halts the workflow. There is no second model and no fallback that grounds the text and moves anyway.
-
-`OLLAMA_HOST` overrides `http://localhost:11434`. The client timeout is 120 seconds.
+Destination kinds are `at`, `on`, `left_of`, `right_of`, and `inside`. Ids come from the live scene. A plan that names anything else is rejected before the arm moves.
 
 ## Perception and motion
 
-One process shares the GPU across Isaac Sim, SAM 2, CoTracker3, OWL-ViT, and cuRobo. OWL-ViT stays loaded. SAM 2 loads for the initial segmentation, seeds CoTracker, and is then released. CoTracker keeps receiving environment-camera frames through approach, grasp, lift, and place. Its latest points stay on screen between online windows, and both the moving object and its support keep their point groups. A later reseed, such as tracking a block after it has been placed, loads SAM again for that new initialization.
+One process shares the GPU across Isaac Sim, OWL-ViT, SAM 2, CoTracker3, OOAL, and cuRobo. OWL-ViT stays loaded. SAM 2 loads for the seed frame, then is released. CoTracker keeps environment-camera frames through approach, grasp, lift, and place, and keeps both the moving object and its support.
 
-Two cameras:
+| Camera | Role |
+| --- | --- |
+| Environment Camera | Fixed view used for grounding, seeding, and tracking. CoTracker points are drawn here. |
+| Wrist Camera | Gripper view. Blocks refine alignment with wrist RGB-D. Side grasps project environment tracks into the wrist. |
 
-- **Environment camera.** Fixed in front of the arm. This is the image perception uses. The window titled "Environment Camera" shows the CoTracker points. The green SAM mask is drawn only on the seed frame, which is also saved to `outputs/frame0_overlay.png`.
-- **Wrist camera.** Mounted on the gripper and aimed into the fingers. The window titled "Wrist Camera" shows this view. For a block, wrist RGB-D refines alignment before the grasp. For a side grasp, the environment-camera tracks are projected into the wrist view instead.
+A side grasp, such as holding the mug and placing it on the plate, keeps the grasp orientation, lifts 40 cm, and hovers 30 cm above the plate. Set-down uses Isaac Sim world collision bounds of the mug and plate at that hover: the hand lowers by the vertical gap minus 1 cm. A gap under 1 cm or over 45 cm keeps the geometric place height.
 
-A color named by an object id is boxed from the image. Other phrases use OWL-ViT. SAM 2 is seeded on those boxes, and a chosen grasp affordance can replace the moving object's points with the grasp region. Depth from the environment camera turns those CoTracker points into the 3D approach. cuRobo obstacle boxes are updated from that depth. A place is reported only when a new depth measurement shows the object at the destination.
+Numeric prompts (`x y` or `x1 y1 x2 y2`) skip Tev1 and approach that image point or box. `home` returns the hand to the startup pose. `quit` closes Kit.
 
-A side grasp, including `hold mug and place it on the plate`, keeps the grasp orientation. The mug is lifted 40 cm and hovered 30 cm above the plate. The set-down distance is not taken from the camera. At the hover pose, Isaac Sim's current world bounds of the mug and plate collision geometry give the gap from the bottom of the mug box to the top of the plate box. The hand lowers by that gap minus 1 cm, then the gripper opens. A gap under 1 cm or over 45 cm keeps the geometric place height instead.
+## GPU memory
 
-cuRobo treats the table, or the kitchen counter, and the other objects as cuboid obstacles, including the object being approached. The grasped object is left out of collision checks only while the fingers are supposed to touch it. The arm replans when the 3D goal moves. A taller neighbor is cleared with a higher transit waypoint before the 10 cm block hover.
+Isaac Sim and the perception stack share one GPU. Tev1 usually runs in a separate Ollama process and may use additional memory if it is also on GPU.
 
-Numeric prompts (`x y` or `x1 y1 x2 y2`) skip Tev1 and approach that image point or box directly. `home` returns the hand to the startup pose. `quit` closes Kit.
+| Component | Typical VRAM | Notes |
+| --- | --- | --- |
+| Isaac Sim + Franka scene | 6–10 GB | Dominates residency for the whole run |
+| OWL-ViT base | ~0.5–1 GB | Stays loaded |
+| SAM 2 Hiera base+ | ~1–2 GB | Loaded to seed CoTracker, then released |
+| CoTracker3 online | ~1 GB | Stays loaded during motion |
+| cuRobo Franka planner | ~1–2 GB | Peak during planning |
+| OOAL seen checkpoint | ~0.5–1 GB | Loaded when a grasp affordance is chosen |
+| Whole process | ≥16 GB recommended | Isaac Sim's published minimum for RTX GPUs with RT cores |
 
 ## Setup
 
 From the repo root.
 
 ### 1. Conda environment
-
-`environment.yml` creates the `ps_vla` env with Python 3.12 and the build tools SAM 2 and cuRobo need (`pip`, `ninja`, `cmake`, `git`, `git-lfs`). It does not install PyTorch, Isaac Sim, or the models. Those come from pip in the steps below.
 
 ```bash
 conda env create -f environment.yml
@@ -107,40 +84,26 @@ conda activate ps_vla
 
 ### 2. PyTorch
 
-Install Torch 2.6 for CUDA 12.4 before the rest of the stack:
-
 ```bash
 pip install torch==2.6.0+cu124 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 ```
 
 ### 3. Python dependencies
 
-`requirements.txt` installs Isaac Sim 6.2, CoTracker, Transformers, and `cuda-core[cu12]`. cuRobo needs that CUDA 12 backend. Without it, `MotionPlannerCfg.create` fails with "No curobo kernel backend available".
-
 ```bash
 pip install -r requirements.txt
 pip install 'nvidia-curobo==0.8.0.post1.dev43' --extra-index-url https://pypi.nvidia.com
 ```
 
-If a later install upgrades Torch, pin it back:
-
-```bash
-pip install torch==2.6.0+cu124 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-```
+cuRobo needs the CUDA 12 backend from `requirements.txt`. Without it, planner creation fails. If a later install upgrades Torch, pin it back to `2.6.0+cu124`.
 
 ### 4. SAM 2 and CoTracker weights
-
-Clone SAM 2 into this repo and install it editable. Keep the Torch pin if that install tries to change it.
 
 ```bash
 git clone https://github.com/facebookresearch/sam2.git segment-anything-2
 SAM2_BUILD_CUDA=1 pip install -e segment-anything-2
 pip install torch==2.6.0+cu124 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-```
 
-Download the SAM 2 base-plus checkpoint and the CoTracker3 online checkpoint:
-
-```bash
 mkdir -p checkpoints
 wget -O checkpoints/sam2_hiera_base_plus.pt \
   https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_base_plus.pt
@@ -149,28 +112,19 @@ wget -O ~/.cache/torch/hub/checkpoints/scaled_online.pth \
   https://huggingface.co/facebook/cotracker3/resolve/main/scaled_online.pth
 ```
 
-`segment-anything-2/` and `checkpoints/` are gitignored.
-
-The first run downloads `google/owlvit-base-patch32` into the Hugging Face cache. Isaac Sim downloads the simple room and Franka from its asset server on first launch, so that run needs network access.
+`segment-anything-2/` and `checkpoints/` are gitignored. The first run downloads `google/owlvit-base-patch32` and Isaac Sim assets, so it needs network access.
 
 ### 5. Tev1
-
-Free-text instructions need a local Ollama server and the 4B decision model. Use Ollama 0.35 or later.
 
 ```bash
 ollama pull tev1:4b
 ```
 
-Confirm the server is up before launching Isaac Sim. The default address is `http://localhost:11434`.
+Use Ollama 0.35 or later. Confirm the server is up before launching Isaac Sim.
 
 ### 6. OOAL, for grasp heatmaps
 
-Affordance selection imports the seen-class list from a local OOAL checkout at `OOAL/` (gitignored). Put the seen-class checkpoint at either of these paths:
-
-- `checkpoints/ooal-models/seen_best`
-- `OOAL/models/checkpoints/seen_best`
-
-Without the checkout, grasp-affordance selection cannot load the class list and the pick stops. Without the checkpoint, Tev1 can still choose a label, but the heatmap is unavailable and the controller tracks the full SAM mask instead.
+Put a local OOAL checkout at `OOAL/` (gitignored) and the seen-class checkpoint at `checkpoints/ooal-models/seen_best` or `OOAL/models/checkpoints/seen_best`. Without the checkout, affordance selection cannot load the class list. Without the checkpoint, Tev1 can still choose a label, but the controller tracks the full SAM mask.
 
 ### 7. Check the GPU stack
 
@@ -180,90 +134,59 @@ python -c "import torch, curobo, cotracker, sam2; print(torch.cuda.is_available(
 
 ## Run
 
-From the repo root, with `ps_vla` active and a display available:
-
 ```bash
 export OMNI_KIT_ACCEPT_EULA=YES
 python scripts/track_and_servo.py
 ```
 
-The first Kit launch is slow. Later launches are faster. At `Instruction>` you can type:
+At `Instruction>`:
 
-- `find the green block` — locate and segment the object. The arm stays put.
-- `stack blue on red` — move blue onto red.
-- `unstack the tower` — move supported blocks to `table`, outermost first. Tev1 sees the observed `supported_by` relations. Python accepts an id only when it is in the scene.
-- `put blue to the left of red` or `put green to the right of blue` — place a block beside another. The robot faces +Y, so left is world −X and right is world +X.
-- `home` — return the hand to its startup pose.
-- `quit` — close Kit.
-
-`at table` uses that block's original table slot and is rejected before motion when the slot is occupied. The same occupancy check applies to `left_of` and `right_of`.
+- `find the green block` — locate and segment the object
+- `stack blue on red` — move blue onto red
+- `unstack the tower` — clear supported blocks to `table`, outermost first
+- `put blue to the left of red` — place beside another object
+- `hold mug and place it on the plate` — kitchen side grasp and set-down
+- `home` / `quit` — return the hand, or close Kit
 
 Useful flags:
 
 ```bash
 python scripts/track_and_servo.py --instruction "stack blue on red"
-python scripts/track_and_servo.py --scene kitchen
+python scripts/track_and_servo.py --scene kitchen --instruction "hold mug and place it on the plate"
 python scripts/track_and_servo.py --stack-prompt "stack green, then red, then blue"
 python scripts/track_and_servo.py --headless
 python scripts/track_and_servo.py --max-steps 600
 ```
 
-`--instruction` submits one task after startup. `--target` is a deprecated alias for it. `--stack-prompt` is the legacy full-stack launch: Tev1 must name red, green, and blue, the order is bottom to top, and the placements run without a pause between them. `--max-steps` is how many simulator steps one move may take before the prompt returns. The default is 600.
+`--instruction` submits one task after startup. `--stack-prompt` asks Tev1 for a full red/green/blue bottom-to-top order before Isaac Sim starts, then runs those placements without a pause. `--max-steps` is how many simulator steps one move may take. The default is 600.
 
-The same launch through conda, without activating the env first:
-
-```bash
-OMNI_KIT_ACCEPT_EULA=YES conda run -n ps_vla python scripts/track_and_servo.py \
-  --instruction "put blue to the left of red"
-```
-
-Kitchen example:
-
-```bash
-OMNI_KIT_ACCEPT_EULA=YES conda run -n ps_vla python scripts/track_and_servo.py \
-  --scene kitchen --instruction "hold mug and place it on the plate"
-```
-
-Each run writes its terminal output to a new file under `outputs/logs/`. `outputs/logs/latest.log` points at the newest one. Step details that are not printed are appended to that file. The first segmented frame is saved to `outputs/frame0_overlay.png`.
-
-## Tests
-
-```bash
-conda run -n ps_vla python -m unittest discover -s tests -v
-```
-
-Tests mock Ollama. They do not need a running model or Isaac Sim.
+Each run writes terminal output under `outputs/logs/`. `outputs/logs/latest.log` points at the newest file. The first segmented frame is saved to `outputs/frame0_overlay.png`.
 
 ## Layout
 
 | Path | Role |
 | --- | --- |
-| `environment.yml` | Conda env `ps_vla`: Python 3.12 and build tools |
-| `requirements.txt` | Isaac Sim 6.2, CoTracker, Transformers, CUDA 12 core |
 | `scripts/track_and_servo.py` | Process entry point |
 | `pseudo_vla/cli.py` | CLI options and Isaac Sim lifecycle |
 | `pseudo_vla/controller.py` | Interactive loop and robot execution |
 | `pseudo_vla/tev1_client.py` | Validated `/v1/systemone` client |
-| `config/tev1_questions.json` | Question bank: text, type, and fixed rubrics |
-| `pseudo_vla/task_llm.py` | Task routing and stage authorization |
+| `config/tev1_questions.json` | Question bank |
+| `pseudo_vla/task_llm.py` | Intent routing and legacy stage authorization |
+| `pseudo_vla/planner.py` | Skill-sequence planning and prerequisite repair |
+| `pseudo_vla/skills.py` | Symbolic world and skill registry |
+| `pseudo_vla/phases.py` | Phase authorization and recovery table |
+| `pseudo_vla/phase_handlers.py` | Perception and motion adapters |
 | `pseudo_vla/task_plan.py` | Typed plan and scene-catalog checks |
-| `pseudo_vla/task_workflow.py` | Ordered execution of a validated plan |
-| `pseudo_vla/stacking_llm.py` | Block-stack order and stack-event choices |
-| `pseudo_vla/stacking_workflow.py` | Stack state machine; motion stays in the controller |
+| `pseudo_vla/task_workflow.py` | Plan execution |
 | `pseudo_vla/affordance.py` | Tev1 affordance choice and OOAL grasp sampling |
-| `pseudo_vla/motion.py` | Pose execution, homing, tracker and camera updates |
-| `pseudo_vla/servo.py` | cuRobo planner and joint playback |
-| `pseudo_vla/scene.py` | Franka, cameras, the active scene, and live collision bounds |
-| `pseudo_vla/blocks.py` | Block colors, size, and table layout |
-| `pseudo_vla/kitchen.py` | Counter, plate, and mug |
 | `pseudo_vla/perception.py` | SAM 2 seeding, then CoTracker3 |
 | `pseudo_vla/grounding.py` | OWL-ViT text grounding |
-| `pseudo_vla/geometry.py` | Projection, depth, collision gap, and robot-frame geometry |
-| `pseudo_vla/view.py` | Wrist viewport and the environment-camera window |
+| `pseudo_vla/motion.py` | Pose execution, homing, tracker and camera updates |
+| `pseudo_vla/servo.py` | cuRobo planner and joint playback |
+| `pseudo_vla/scene.py` | Franka, cameras, active scene, collision bounds |
+| `pseudo_vla/blocks.py` / `kitchen.py` | Scene props |
+| `pseudo_vla/geometry.py` | Projection, depth, collision gap, robot-frame geometry |
+| `pseudo_vla/view.py` | Camera windows |
 | `pseudo_vla/runlog.py` | Per-run log under `outputs/logs/` |
-| `scripts/plan.md` | Historical Llama/d3 plan. The live path is Tev1, documented above |
-| `checkpoints/` | SAM 2 weights, and optionally the OOAL seen checkpoint |
-| `segment-anything-2/` | Local SAM 2 clone |
-| `OOAL/` | Local OOAL checkout used for seen affordance classes |
-
-`scripts/plan.md` records the earlier Llama and d3 design. The running code does not call those models.
+| `pseudo_vla/eval_plans.py` | Prompt-suite scoring for the planner |
+| `DECISIONS.md` | Ambiguous design choices for the skill registry |
