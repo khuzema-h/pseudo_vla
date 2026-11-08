@@ -77,16 +77,18 @@ A timeout, HTTP error, malformed answer, unknown id, or `stop` halts the workflo
 
 ## Perception and motion
 
-One process shares the GPU across Isaac Sim, SAM 2, CoTracker3, OWL-ViT, and cuRobo. SAM 2 and OWL-ViT load once and stay resident. CoTracker keeps receiving frames while idle and during motion, and is reseeded when a new prompt selects an object.
+One process shares the GPU across Isaac Sim, SAM 2, CoTracker3, OWL-ViT, and cuRobo. OWL-ViT stays loaded. SAM 2 loads for the initial segmentation, seeds CoTracker, and is then released. CoTracker keeps receiving environment-camera frames through approach, grasp, lift, and place. Its latest points stay on screen between online windows, and both the moving object and its support keep their point groups. A later reseed, such as tracking a block after it has been placed, loads SAM again for that new initialization.
 
 Two cameras:
 
-- **Environment camera.** Fixed in front of the arm. This is the image perception uses. The window titled "SAM + CoTracker" shows the mask and tracked points.
-- **Wrist camera.** Mounted on the gripper and aimed into the fingers. The window titled "Wrist Camera" shows this view. Wrist RGB-D refines alignment before a grasp.
+- **Environment camera.** Fixed in front of the arm. This is the image perception uses. The window titled "Environment Camera" shows the CoTracker points. The green SAM mask is drawn only on the seed frame, which is also saved to `outputs/frame0_overlay.png`.
+- **Wrist camera.** Mounted on the gripper and aimed into the fingers. The window titled "Wrist Camera" shows this view. For a block, wrist RGB-D refines alignment before the grasp. For a side grasp, the environment-camera tracks are projected into the wrist view instead.
 
-A color named by an object id is boxed from the image. Other phrases use OWL-ViT. SAM 2 is seeded on those boxes. Depth from the same camera turns CoTracker points into the 3D approach. Positions used for collision boxes, clearance, and placement come from that depth. A place is reported only when a new depth measurement shows the object at the destination.
+A color named by an object id is boxed from the image. Other phrases use OWL-ViT. SAM 2 is seeded on those boxes, and a chosen grasp affordance can replace the moving object's points with the grasp region. Depth from the environment camera turns those CoTracker points into the 3D approach. cuRobo obstacle boxes are updated from that depth. A place is reported only when a new depth measurement shows the object at the destination.
 
-cuRobo treats the table, or the kitchen counter, and the other objects as cuboid obstacles, including the object being approached. The grasped object is left out of collision checks only while the fingers are supposed to touch it. The arm replans when the 3D goal moves. A taller neighbor is cleared with a higher transit waypoint before the 10 cm hover.
+A side grasp, including `hold mug and place it on the plate`, keeps the grasp orientation. The mug is lifted 40 cm and hovered 30 cm above the plate. The set-down distance is not taken from the camera. At the hover pose, Isaac Sim's current world bounds of the mug and plate collision geometry give the gap from the bottom of the mug box to the top of the plate box. The hand lowers by that gap minus 1 cm, then the gripper opens. A gap under 1 cm or over 45 cm keeps the geometric place height instead.
+
+cuRobo treats the table, or the kitchen counter, and the other objects as cuboid obstacles, including the object being approached. The grasped object is left out of collision checks only while the fingers are supposed to touch it. The arm replans when the 3D goal moves. A taller neighbor is cleared with a higher transit waypoint before the 10 cm block hover.
 
 Numeric prompts (`x y` or `x1 y1 x2 y2`) skip Tev1 and approach that image point or box directly. `home` returns the hand to the startup pose. `quit` closes Kit.
 
@@ -251,13 +253,13 @@ Tests mock Ollama. They do not need a running model or Isaac Sim.
 | `pseudo_vla/affordance.py` | Tev1 affordance choice and OOAL grasp sampling |
 | `pseudo_vla/motion.py` | Pose execution, homing, tracker and camera updates |
 | `pseudo_vla/servo.py` | cuRobo planner and joint playback |
-| `pseudo_vla/scene.py` | Franka, cameras, and the active scene |
+| `pseudo_vla/scene.py` | Franka, cameras, the active scene, and live collision bounds |
 | `pseudo_vla/blocks.py` | Block colors, size, and table layout |
 | `pseudo_vla/kitchen.py` | Counter, plate, and mug |
-| `pseudo_vla/perception.py` | SAM 2 and CoTracker3 |
+| `pseudo_vla/perception.py` | SAM 2 seeding, then CoTracker3 |
 | `pseudo_vla/grounding.py` | OWL-ViT text grounding |
-| `pseudo_vla/geometry.py` | Projection, depth, and robot-frame geometry |
-| `pseudo_vla/view.py` | Wrist viewport and the SAM + CoTracker window |
+| `pseudo_vla/geometry.py` | Projection, depth, collision gap, and robot-frame geometry |
+| `pseudo_vla/view.py` | Wrist viewport and the environment-camera window |
 | `pseudo_vla/runlog.py` | Per-run log under `outputs/logs/` |
 | `scripts/plan.md` | Historical Llama/d3 plan. The live path is Tev1, documented above |
 | `checkpoints/` | SAM 2 weights, and optionally the OOAL seen checkpoint |
