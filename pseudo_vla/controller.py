@@ -134,18 +134,19 @@ def run(app, args: argparse.Namespace) -> None:
 
         if SCENE_NAME == "kitchen":
             say(
-                'Enter a pick-and-place instruction, such as "hold mug and place it on the plate".'
+                'Enter an instruction: full pick-and-place (e.g. "hold mug and place it on the plate") '
+                'or individual stages (e.g. "approach mug", "grasp mug", "lift mug", "place on the plate").'
             )
         else:
             say(
-                'Enter a pick-and-place instruction, such as "stack blue on red", '
-                '"unstack the tower", or "put blue to the left of red".'
+                'Enter an instruction: full pick-and-place (e.g. "stack blue on red", "unstack the tower") '
+                'or individual stages (e.g. "approach blue", "lift blue", "place on red").'
             )
         say(
             f"This {SCENE_NAME} scene has {', '.join(object_id(spec) for spec in SCENE_OBJECTS)}. "
             f"Place them at {surface_location()}, on, or beside one another."
         )
-        say("Commands: home, quit")
+        say("Commands: home, quit, release, retreat")
         threading.Thread(target=read_commands, daemon=True).start()
 
         stack_order = getattr(args, "stack_order", None)
@@ -158,6 +159,9 @@ def run(app, args: argparse.Namespace) -> None:
             else:
                 say("prompted stack stopped; returning to the interactive prompt")
 
+        from pseudo_vla.stage_control import ControllerStageState
+
+        stage_state = ControllerStageState()
         pending = _initial_command(args)
         prompt_shown = False
         while True:
@@ -179,9 +183,10 @@ def run(app, args: argparse.Namespace) -> None:
             if command in QUIT_COMMANDS:
                 say("closing")
                 return
-            if scene.gripper_closed:
+            if scene.gripper_closed and not stage_state.held_object:
                 _open_gripper_for_next_command(scene, perception, say, view)
             if command == "home":
+                stage_state.reset()
                 pending = _home(scene, perception, servo, commands, args.max_steps, say, log, view)
                 continue
             pending = _dispatch_user_prompt(
@@ -194,6 +199,7 @@ def run(app, args: argparse.Namespace) -> None:
                 say,
                 log,
                 view,
+                stage_state=stage_state,
             )
     except Exception:
         import traceback
@@ -216,12 +222,34 @@ def _dispatch_user_prompt(
     say,
     log,
     view,
+    stage_state=None,
 ) -> str | None:
     numbers = _numbers(prompt)
     if numbers is not None and len(numbers) in {2, 4}:
         return _move_to_prompt(
             scene, perception, servo, prompt, commands, max_steps, say, log, view
         )
+
+    if stage_state is not None:
+        from pseudo_vla.scene import SCENE_OBJECTS, object_id, surface_location
+        from pseudo_vla.stage_control import parse_stage_instruction
+
+        catalog_objects = tuple(object_id(spec) for spec in SCENE_OBJECTS)
+        catalog_locations = (surface_location(),)
+        stage_req = parse_stage_instruction(prompt, catalog_objects, catalog_locations)
+        if stage_req is not None:
+            return _dispatch_stage_request(
+                scene,
+                perception,
+                servo,
+                stage_req,
+                commands,
+                max_steps,
+                say,
+                log,
+                view,
+                stage_state,
+            )
 
     from pseudo_vla.tev1_client import Tev1Error
     from pseudo_vla.task_llm import interpret_task_prompt
@@ -317,7 +345,717 @@ def _dispatch_user_prompt(
         execute_action,
     )
     say("task plan complete" if complete else "task plan stopped safely")
+    if stage_state is not None:
+        stage_state.reset()
     return None
+
+
+def _dispatch_stage_request(
+    scene,
+    perception,
+    servo,
+    request,
+    commands,
+    max_steps: int,
+    say,
+    log,
+    view,
+    state,
+) -> str | None:
+    from pseudo_vla.stage_control import plan_stage_prerequisites
+
+    prereqs, error = plan_stage_prerequisites(request, state)
+    if error is not None:
+        say(f"could not execute {request.stage}: {error}")
+        return None
+
+    full_chain = [*prereqs, request.stage]
+    target_name = request.object_id or state.held_object or state.target_object
+
+    target_display = f" on {target_name}" if target_name and request.stage not in ("release", "retreat") else ""
+    if request.destination:
+        target_display += f" at {request.destination.kind} {request.destination.target}"
+    say(f"executing stage {request.stage}{target_display}")
+
+    for step in full_chain:
+        is_prereq = step in prereqs
+        if is_prereq:
+            say(f"prerequisite: executing {step} first")
+
+        if step == "approach":
+            ok = _stage_approach(
+                scene, perception, servo, target_name, commands, max_steps, say, log, view, state
+            )
+            if not ok:
+                say(f"stage approach failed for {target_name}")
+                return None
+        elif step == "grasp":
+            ok = _stage_grasp(
+                scene, perception, servo, target_name, commands, max_steps, say, log, view, state
+            )
+            if not ok:
+                say(f"stage grasp failed for {target_name}")
+                return None
+        elif step == "lift":
+            ok = _stage_lift(
+                scene, perception, servo, target_name, commands, max_steps, say, log, view, state
+            )
+            if not ok:
+                say(f"stage lift failed for {target_name}")
+                return None
+        elif step == "place":
+            ok = _stage_place(
+                scene, perception, servo, target_name, request.destination, commands, max_steps, say, log, view, state
+            )
+            if not ok:
+                say("stage place failed")
+                return None
+        elif step == "release":
+            ok = _stage_release(
+                scene, perception, servo, commands, max_steps, say, log, view, state
+            )
+            if not ok:
+                say("stage release failed")
+                return None
+        elif step == "retreat":
+            ok = _stage_retreat(scene, servo, commands, max_steps, log, view, state)
+            if not ok:
+                say("stage retreat failed")
+                return None
+
+    say(f"stage {request.stage} complete")
+    return None
+
+
+def _ensure_object_tracking(scene, perception, moving_name: str, say, view) -> tuple[bool, str | None]:
+    from pseudo_vla.affordance import choose_seen_affordance, grasp_region_points
+    from pseudo_vla.tev1_client import Tev1Error
+    from pseudo_vla.scene import SCENE_OBJECTS, object_id
+
+    scene.step()
+    rgb, depth, camera_params = scene.read_sensors()
+    measured = _measure_frame(perception, rgb, depth, camera_params, scene.camera_path, say)
+    _remember_home(scene, measured)
+    _store_observed(scene, measured)
+    item = measured.get(moving_name)
+    if item is None:
+        say(f"environment camera could not localize {moving_name}")
+        return False, None
+    perception.segment_groups(rgb, {"moving": (None, item.box)})
+    specs = {object_id(spec): spec for spec in SCENE_OBJECTS}
+    moving_spec = specs.get(moving_name, {})
+    affordance = None
+    try:
+        affordance = choose_seen_affordance(f"hold {moving_name}", moving_name)
+    except Tev1Error:
+        affordance = None
+    if affordance is None and moving_spec.get("kind") in {"asset", "mug", "cup"}:
+        affordance = "hold"
+    if affordance:
+        region_points = grasp_region_points(rgb, perception.group_masks["moving"], affordance)
+        if region_points is None:
+            say(
+                f"seen affordance {affordance} had no grasp region inside {moving_name}; "
+                "tracking the full SAM mask"
+            )
+            affordance = None
+        else:
+            perception.replace_group_points(rgb, "moving", region_points)
+            say(
+                f"seen affordance {affordance} seeded {len(region_points)} CoTracker points "
+                f"on the grasp region of {moving_name}"
+            )
+    else:
+        say(f"no seen affordance in the instruction; tracking the full SAM mask of {moving_name}")
+    perception.release_sam()
+    _update_camera_views(scene, view, rgb, depth, None, perception.query_xy)
+    say(f"tracking {moving_name} with {len(perception.query_xy)} CoTracker points")
+    return True, affordance
+
+
+def _stage_approach(
+    scene, perception, servo, moving_name: str, commands, max_steps: int, say, log, view, state
+) -> bool:
+    from pseudo_vla.geometry import (
+        HANDLE_PINCH_SLIDE,
+        adaptive_approach_pose,
+        adaptive_grasp_orientation,
+        base_to_world_quat,
+        slide_grasp_toward_handle,
+        world_to_base_quat,
+    )
+    from pseudo_vla.perception import ApproachGoal, STANDOFF_Z, prim_world_pose, world_to_base
+    from pseudo_vla.scene import SCENE_OBJECTS, TABLE_TOP_Z, object_id
+
+    if not moving_name:
+        say("no target object specified to approach")
+        return False
+
+    affordance = state.context.get("affordance") if state.context else None
+    if state.context is None or state.context.get("moving_name") != moving_name:
+        ok, affordance = _ensure_object_tracking(scene, perception, moving_name, say, view)
+        if not ok:
+            return False
+        if state.context is None:
+            state.context = {}
+        state.context["moving_name"] = moving_name
+        state.context["affordance"] = affordance
+
+    say("Tev1 selected task event: approach")
+    specs = {object_id(spec): spec for spec in SCENE_OBJECTS}
+    moving_spec = specs[moving_name]
+    moving_item = _observed(scene).get(moving_name)
+    if moving_item is None:
+        say(f"environment camera has no depth pose for {moving_name}")
+        return False
+
+    moving_dims = moving_item.dims
+    is_tall_or_mug = (
+        moving_spec.get("kind") in {"asset", "mug", "cup"}
+        or affordance == "hold"
+    )
+    grasp_style = "side" if is_tall_or_mug else "auto"
+    transit = _needs_approach_transit(scene, moving_name)
+
+    say(f"approaching {moving_name}")
+    servo.clear()
+    grasp_box_ignored = _set_obstacle_enabled(servo, moving_spec["name"], False)
+    if grasp_box_ignored:
+        say(f"ignoring the {moving_name} collision box so the gripper can reach the grasp")
+
+    hover_goal = None
+    hover_surface = None
+    hover_points = None
+    obj_center = moving_item.center_world
+    plan_goal = None
+
+    try:
+        for step in range(max_steps):
+            incoming = _poll(commands)
+            if incoming:
+                commands.put(incoming)
+                return False
+            scene.step()
+            rgb, depth, camera_params = scene.read_sensors()
+            tracked = perception.push_frame(rgb)
+            tracks_xy = None
+            visible = None
+            if tracked is not None:
+                tracks_xy, visible = tracked
+                goal = perception.approach_goal(
+                    tracks_xy,
+                    visible,
+                    depth,
+                    camera_params,
+                    scene.camera_path,
+                    scene.base_path,
+                    group="moving",
+                    object_center=obj_center,
+                    grasp_style=grasp_style,
+                    surface_z=TABLE_TOP_Z,
+                )
+                if goal is not None:
+                    surface = goal.center_world.copy()
+                    if hover_goal is None or abs(float(goal.top_z) - float(hover_goal.top_z)) <= 0.04:
+                        goal.center_world[2] = goal.top_z - moving_dims[2] / 2.0
+                        hover_goal = goal
+                        hover_surface = surface
+                        hover_points = perception.tracked_group_points(
+                            "moving", tracks_xy, visible, depth, camera_params, scene.camera_path
+                        )
+                        plan_goal = hover_goal
+                        if transit:
+                            base_world, base_quat = prim_world_pose(scene.base_path)
+                            plan_goal = _stack_transit_goal(hover_goal, base_world, base_quat)
+                        servo.update_goal(plan_goal, scene.joint_positions())
+
+            _update_camera_views(
+                scene, view, rgb, depth, None,
+                tracks_xy if tracks_xy is not None else perception.query_xy,
+                visible if visible is not None else None,
+            )
+            command = servo.command()
+            if command:
+                scene.set_joint_targets(command)
+            if hover_goal is None or plan_goal is None:
+                continue
+            current_hand = servo.hand_position(scene.joint_positions())
+            hand_error = float(np.linalg.norm(current_hand - plan_goal.position))
+            if hand_error <= APPROACH_TOLERANCE:
+                if transit:
+                    transit = False
+                    servo.update_goal(hover_goal, scene.joint_positions())
+                    say(f"at safe approach height above {moving_name}; descending to the hover waypoint")
+                    continue
+                break
+        else:
+            say(f"could not reach the hover waypoint for {moving_name}")
+            return False
+
+        if affordance:
+            source_points = hover_points if hover_points is not None and len(hover_points) >= 4 else hover_surface.reshape(1, 3)
+            transferred = _transfer_env_tracks_to_wrist(scene, source_points)
+            if transferred is None:
+                say(
+                    "could not transfer the CoTracker points into the wrist camera; "
+                    "aligning over the environment-camera points"
+                )
+                moving_center = hover_surface.copy()
+                grasp_top = float(hover_goal.top_z)
+            else:
+                moving_center, grasp_top = transferred
+                say(
+                    f"transferred CoTracker points into the wrist camera at "
+                    f"{moving_center.round(3).tolist()}"
+                )
+            base_world, base_quat = prim_world_pose(scene.base_path)
+            quat_world = adaptive_grasp_orientation(source_points, object_center=obj_center, grasp_style=grasp_style)
+            grasp_quaternion = world_to_base_quat(quat_world, base_quat)
+            pinch_point, finger_reach = _grasp_contact_target(moving_center, obj_center, grasp_style, TABLE_TOP_Z)
+            align_world = adaptive_approach_pose(pinch_point, quat_world, standoff=STANDOFF_Z, finger_reach=finger_reach)
+            align_goal = ApproachGoal(
+                position=world_to_base(align_world.reshape(1, 3), base_world, base_quat)[0],
+                quaternion=grasp_quaternion,
+                center_world=moving_center.copy(),
+                top_z=grasp_top,
+            )
+            say(f"aligning over the {affordance} points before the grasp")
+            reached, pending = _execute_pose(scene, servo, align_goal, perception, commands, max_steps, log, view)
+            if pending is not None or not reached:
+                say(f"could not align over the {affordance} points of {moving_name}")
+                return False
+            transferred = _transfer_env_tracks_to_wrist(scene, source_points)
+            if transferred is not None:
+                moving_center, grasp_top = transferred
+                say(
+                    f"wrist view of the transferred points is {moving_center.round(3).tolist()}, "
+                    f"top z {grasp_top:.3f}"
+                )
+        else:
+            wrist_hover_goal = _wrist_rgbd_goal(
+                scene, perception, moving_name, hover_goal.center_world, hover_goal.quaternion, moving_dims, say
+            )
+            if wrist_hover_goal is None:
+                return False
+            reached, pending = _execute_pose(scene, servo, wrist_hover_goal, perception, commands, max_steps, log, view)
+            if pending is not None or not reached:
+                return False
+            grasp_alignment = _wrist_rgbd_goal(
+                scene, perception, moving_name, wrist_hover_goal.center_world, hover_goal.quaternion, moving_dims, say
+            )
+            if grasp_alignment is None:
+                return False
+            moving_center = grasp_alignment.center_world.copy()
+            grasp_top = float(grasp_alignment.top_z)
+            grasp_quaternion = grasp_alignment.quaternion.copy()
+
+        base_world, base_quat = prim_world_pose(scene.base_path)
+        quat_world = base_to_world_quat(grasp_quaternion, base_quat)
+        pinch_point, finger_reach = _grasp_contact_target(moving_center, moving_item.center_world, grasp_style, TABLE_TOP_Z)
+        grasp_world = adaptive_approach_pose(pinch_point, quat_world, standoff=0.0, finger_reach=finger_reach)
+        if grasp_style == "side":
+            grasp_world = slide_grasp_toward_handle(grasp_world, quat_world, HANDLE_PINCH_SLIDE)
+        grasp_goal = ApproachGoal(
+            position=world_to_base(grasp_world.reshape(1, 3), base_world, base_quat)[0],
+            quaternion=grasp_quaternion,
+            center_world=moving_center.copy(),
+            top_z=grasp_top,
+        )
+        lift_height = _lift_height(moving_spec, grasp_style)
+        lift_world = grasp_world.copy()
+        lift_world[2] += lift_height
+        lift_goal = ApproachGoal(
+            position=world_to_base(lift_world.reshape(1, 3), base_world, base_quat)[0],
+            quaternion=grasp_goal.quaternion.copy(),
+            center_world=moving_center.copy(),
+            top_z=grasp_top,
+        )
+
+        state.context = {
+            "moving_name": moving_name,
+            "moving_spec": moving_spec,
+            "moving_dims": moving_dims,
+            "moving_item": moving_item,
+            "grasp_style": grasp_style,
+            "hover_goal": hover_goal,
+            "grasp_goal": grasp_goal,
+            "lift_goal": lift_goal,
+            "grasp_world": grasp_world,
+            "lift_height": lift_height,
+            "affordance": affordance,
+        }
+        state.stage = "approached"
+        state.target_object = moving_name
+        return True
+    finally:
+        if state.stage not in ("grasped", "lifted"):
+            _set_obstacle_enabled(servo, moving_spec["name"], True)
+
+
+def _stage_grasp(
+    scene, perception, servo, moving_name: str, commands, max_steps: int, say, log, view, state
+) -> bool:
+    if state.context is None:
+        say("cannot grasp without approach context")
+        return False
+    say("Tev1 selected task event: grasp")
+    ctx = state.context
+    grasp_goal = ctx["grasp_goal"]
+    moving_spec = ctx["moving_spec"]
+
+    _set_obstacle_enabled(servo, moving_spec["name"], False)
+    say(f"grasping {moving_name}")
+    reached, pending = _execute_pose(scene, servo, grasp_goal, perception, commands, max_steps, log, view)
+    if pending is not None or not reached:
+        say(f"could not lower the gripper to grasp {moving_name}")
+        return False
+
+    say(f"closing the gripper on {moving_name}")
+    pending = _close_gripper_in_place(scene, perception, commands, view)
+    if pending is not None:
+        return False
+
+    state.stage = "grasped"
+    state.held_object = moving_name
+    return True
+
+
+def _stage_lift(
+    scene, perception, servo, moving_name: str, commands, max_steps: int, say, log, view, state
+) -> bool:
+    if state.context is None:
+        say("cannot lift without context")
+        return False
+    say("Tev1 selected task event: lift")
+    ctx = state.context
+    lift_goal = ctx["lift_goal"]
+    lift_height = ctx["lift_height"]
+
+    say(f"lifting {moving_name} by {lift_height:.2f} m")
+    reached, pending = _execute_pose(scene, servo, lift_goal, perception, commands, max_steps, log, view)
+    if pending is not None or not reached:
+        say(f"could not lift {moving_name}")
+        return False
+
+    state.stage = "lifted"
+    state.held_object = moving_name
+    return True
+
+
+def _stage_place(
+    scene, perception, servo, moving_name: str, destination, commands, max_steps: int, say, log, view, state
+) -> bool:
+    if state.context is None:
+        say("cannot place without object context")
+        return False
+    ctx = state.context
+    grasp_style = ctx["grasp_style"]
+    grasp_world = ctx["grasp_world"]
+    grasp_goal = ctx["grasp_goal"]
+    moving_item = ctx["moving_item"]
+    moving_dims = ctx["moving_dims"]
+    moving_spec = ctx["moving_spec"]
+
+    from pseudo_vla.scene import SCENE_OBJECTS, TABLE_TOP_Z, object_id
+
+    specs = {object_id(spec): spec for spec in SCENE_OBJECTS}
+    target_name = None if destination.kind == "at" else destination.target
+    support_spec = specs.get(target_name) if target_name is not None else None
+
+    # Track support if needed
+    if target_name is not None and "support" not in getattr(perception, "query_groups", {}):
+        scene.step()
+        rgb, depth, camera_params = scene.read_sensors()
+        measured = _measure_frame(perception, rgb, depth, camera_params, scene.camera_path, say)
+        if target_name in measured:
+            perception.segment_groups(rgb, {"support": (None, measured[target_name].box)})
+            perception.release_sam()
+
+    destination_label = destination.kind
+    if destination.target:
+        destination_label = f"{destination.kind} {destination.target}"
+
+    say(f"planning {moving_name} placement at {destination_label}")
+    preplace_goal = None
+    place_goal = None
+
+    for step in range(max_steps):
+        incoming = _poll(commands)
+        if incoming:
+            commands.put(incoming)
+            return False
+        scene.step()
+        rgb, depth, camera_params = scene.read_sensors()
+        tracked = perception.push_frame(rgb)
+        tracks_xy = None
+        visible = None
+        if tracked is not None:
+            tracks_xy, visible = tracked
+        if destination.kind == "on" and tracks_xy is not None:
+            support_points = perception.tracked_group_points(
+                "support", tracks_xy, visible, depth, camera_params, scene.camera_path
+            )
+            if support_points.shape[0] >= 4:
+                if grasp_style == "side":
+                    preplace_goal, place_goal = _side_placement_goals(
+                        support_points, grasp_world, moving_item.center_world, TABLE_TOP_Z, grasp_goal.quaternion, scene.base_path,
+                        clearance=_placement_clearance(support_spec),
+                    )
+                else:
+                    preplace_goal, place_goal = _stack_placement_goals(
+                        support_points, moving_dims, scene.base_path, clearance=_placement_clearance(support_spec),
+                    )
+                servo.update_goal(preplace_goal, scene.joint_positions())
+        elif destination.kind != "on":
+            preplace_goal, place_goal = _relative_placement_goals(scene, moving_name, destination, scene.base_path)
+            servo.update_goal(preplace_goal, scene.joint_positions())
+
+        command = servo.command()
+        if command:
+            scene.set_joint_targets(command)
+        _update_camera_views(scene, view, rgb, depth, None, tracks_xy if tracks_xy is not None else perception.query_xy, visible)
+        if preplace_goal is not None and float(np.linalg.norm(servo.hand_position(scene.joint_positions()) - preplace_goal.position)) <= APPROACH_TOLERANCE:
+            break
+    else:
+        say(f"could not reach the placement waypoint for {destination_label}")
+        return False
+
+    if grasp_style == "side" and destination.kind == "on" and target_name:
+        lowered = _place_goal_for_collision_gap(scene, moving_name, target_name, preplace_goal, say)
+        if lowered is not None:
+            place_goal = lowered
+
+    say("Tev1 selected task event: place")
+    if destination.kind == "on" and support_spec is not None:
+        servo.set_obstacle_enabled(support_spec["name"], False)
+    try:
+        say(f"placing {moving_name} at {destination_label}")
+        reached, pending = _execute_pose(
+            scene, servo, place_goal, perception, commands, max_steps, log, view,
+            release_when_supported=grasp_style == "side",
+        )
+        if pending is not None or not reached:
+            return False
+        scene.set_gripper_closed(False)
+        _settle_tracker(scene, perception, GRIPPER_SETTLE_STEPS, view)
+    finally:
+        if destination.kind == "on" and support_spec is not None:
+            servo.set_obstacle_enabled(support_spec["name"], True)
+
+    reached, pending = _execute_pose(scene, servo, preplace_goal, perception, commands, max_steps, log, view)
+    if pending is not None or not reached:
+        return False
+
+    _confirm_placement(scene, perception, moving_name, destination, say)
+    _seed_placed_cube_tracking(scene, perception, moving_name, say, view)
+    say("Tev1 selected task event: verify_placement")
+    say(f"placed {moving_name} at {destination_label}")
+    state.reset()
+    return True
+
+
+def _stage_release(scene, perception, servo, commands, max_steps, say, log, view, state) -> bool:
+    if not scene.gripper_closed:
+        say("gripper already open; nothing to release")
+        _finish_release_state(state)
+        return True
+
+    held_name = state.held_object or state.target_object
+    if held_name is None:
+        say("no known held object; opening the gripper in place")
+        _open_gripper_for_next_command(scene, perception, say, view)
+        _finish_release_state(state)
+        return True
+
+    context = state.context
+    if context is None:
+        say(f"cannot safely release {held_name} without its grasp context")
+        return False
+
+    from pseudo_vla.geometry import ApproachGoal
+    from pseudo_vla.perception import prim_world_pose, world_to_base
+    from pseudo_vla.scene import spec_by_id
+
+    moving_item = context["moving_item"]
+    moving_dims = np.asarray(context["moving_dims"], dtype=np.float64).reshape(3)
+    grasp_world = np.asarray(context["grasp_world"], dtype=np.float64).reshape(3)
+    hand_world, _ = prim_world_pose(scene.hand_path)
+    hand_world = np.asarray(hand_world, dtype=np.float64).reshape(3)
+    object_offset = np.asarray(moving_item.center_world, dtype=np.float64).reshape(3) - grasp_world
+    object_center = hand_world + object_offset
+
+    support = _release_surface_below(scene, held_name, object_center, moving_dims, say)
+    if support is None:
+        say(f"no collision surface below {held_name}; releasing in place")
+        _open_gripper_for_next_command(scene, perception, say, view)
+        _finish_release_state(state)
+        _record_released_object(
+            servo, scene, context["moving_spec"], object_center, moving_dims, enable=True
+        )
+        return True
+
+    support_name, support_top = support
+    release_center = object_center.copy()
+    release_center[2] = support_top + moving_dims[2] / 2.0 + PLATE_RELEASE_BUFFER
+    release_hand = hand_world.copy()
+    release_hand[2] += release_center[2] - object_center[2]
+    hover_hand = release_hand.copy()
+    hover_hand[2] = max(hand_world[2], release_hand[2] + PLATE_HOVER_CLEARANCE)
+
+    base_world, base_quat = prim_world_pose(scene.base_path)
+    grasp_goal = context["grasp_goal"]
+
+    def make_goal(hand_position: np.ndarray) -> ApproachGoal:
+        return ApproachGoal(
+            position=world_to_base(hand_position.reshape(1, 3), base_world, base_quat)[0],
+            quaternion=np.asarray(grasp_goal.quaternion, dtype=np.float64).copy(),
+            center_world=release_center.copy(),
+            top_z=float(support_top + moving_dims[2]),
+        )
+
+    hover_goal = make_goal(hover_hand)
+    release_goal = make_goal(release_hand)
+    support_spec = spec_by_id(support_name)
+    support_obstacle = support_spec["name"] if support_spec is not None else support_name
+    moving_spec = context["moving_spec"]
+
+    if support_obstacle != "table":
+        _set_obstacle_enabled(servo, support_obstacle, False)
+    released = False
+    try:
+        say(f"moving {held_name} above the nearest surface ({support_name})")
+        reached, pending = _execute_pose(
+            scene, servo, hover_goal, perception, commands, max_steps, log, view
+        )
+        if pending is not None:
+            commands.put(pending)
+        if pending is not None or not reached:
+            return False
+
+        say(f"lowering {held_name} to the release height")
+        reached, pending = _execute_pose(
+            scene,
+            servo,
+            release_goal,
+            perception,
+            commands,
+            max_steps,
+            log,
+            view,
+            release_when_supported=True,
+        )
+        if pending is not None:
+            commands.put(pending)
+        if pending is not None or not reached:
+            return False
+
+        _open_gripper_for_next_command(scene, perception, say, view)
+        _finish_release_state(state)
+        released = True
+
+        _record_released_object(servo, scene, moving_spec, release_center, moving_dims)
+
+        reached, pending = _execute_pose(
+            scene, servo, hover_goal, perception, commands, max_steps, log, view
+        )
+        if pending is not None:
+            commands.put(pending)
+        if pending is not None or not reached:
+            say(f"{held_name} was released, but the gripper could not retreat")
+            return False
+    finally:
+        if support_obstacle != "table":
+            _set_obstacle_enabled(servo, support_obstacle, True)
+        if released:
+            _set_obstacle_enabled(servo, moving_spec["name"], True)
+
+    say(f"released {held_name} onto {support_name}")
+    return True
+
+
+def _release_surface_below(scene, moving_name, object_center, moving_dims, say):
+    from pseudo_vla.scene import (
+        TABLE_MAX,
+        TABLE_MIN,
+        TABLE_TOP_Z,
+        spec_by_id,
+        world_collision_bounds,
+    )
+
+    center = np.asarray(object_center, dtype=np.float64).reshape(3)
+    dims = np.asarray(moving_dims, dtype=np.float64).reshape(3)
+    object_min = center[:2] - dims[:2] / 2.0
+    object_max = center[:2] + dims[:2] / 2.0
+    object_bottom = float(center[2] - dims[2] / 2.0)
+    moving_spec = spec_by_id(moving_name)
+    moving_prim_name = moving_spec["name"] if moving_spec is not None else moving_name
+    candidates = []
+
+    table_overlap = np.minimum(object_max, TABLE_MAX[:2]) - np.maximum(object_min, TABLE_MIN[:2])
+    table_contains_center = np.all(center[:2] >= TABLE_MIN[:2]) and np.all(
+        center[:2] <= TABLE_MAX[:2]
+    )
+    if np.all(table_overlap > 0) and table_contains_center and TABLE_TOP_Z < object_bottom:
+        candidates.append(("table", float(TABLE_TOP_Z)))
+
+    for name, path in (getattr(scene, "object_paths", {}) or {}).items():
+        if name in {moving_name, moving_prim_name}:
+            continue
+        try:
+            minimum, maximum = world_collision_bounds(path)
+        except RuntimeError as error:
+            say(f"could not read collision bounds for {name}: {error}")
+            continue
+        overlap = np.minimum(object_max, maximum[:2]) - np.maximum(object_min, minimum[:2])
+        top_z = float(maximum[2])
+        contains_center = np.all(center[:2] >= minimum[:2]) and np.all(
+            center[:2] <= maximum[:2]
+        )
+        if np.all(overlap > 0) and contains_center and top_z < object_bottom:
+            candidates.append((name, top_z))
+
+    return max(candidates, key=lambda candidate: candidate[1]) if candidates else None
+
+
+def _finish_release_state(state) -> None:
+    state.held_object = None
+    state.stage = "released"
+    state.target_object = None
+    state.context = None
+
+
+def _record_released_object(
+    servo, scene, moving_spec, center, dims, *, enable: bool = False
+) -> None:
+    observed = _observed(scene)
+    centers = {item.spec_name: item.center_world for item in observed.values()}
+    dimensions = {item.spec_name: item.dims for item in observed.values()}
+    centers[moving_spec["name"]] = np.asarray(center, dtype=np.float64).copy()
+    dimensions[moving_spec["name"]] = np.asarray(dims, dtype=np.float64).copy()
+    servo.update_block_positions(centers, dimensions)
+    if enable:
+        _set_obstacle_enabled(servo, moving_spec["name"], True)
+
+
+def _stage_retreat(scene, servo, commands, max_steps: int, log, view, state) -> bool:
+    from pseudo_vla.perception import ApproachGoal, STANDOFF_Z, prim_world_pose, world_to_base
+
+    current_hand = servo.hand_position(scene.joint_positions())
+    base_world, base_quat = prim_world_pose(scene.base_path)
+    retreat_pos = current_hand.copy()
+    retreat_pos[2] += STANDOFF_Z
+    retreat_goal = ApproachGoal(
+        position=retreat_pos,
+        quaternion=np.array([0.0, 1.0, 0.0, 0.0]),
+        center_world=current_hand,
+        top_z=float(current_hand[2]),
+    )
+    reached, pending = _execute_pose(scene, servo, retreat_goal, None, commands, max_steps, log, view)
+    if reached:
+        state.stage = "retreat"
+        say("retreated gripper")
+        return True
+    return False
 
 
 def _task_scene_state(scene, perception) -> dict[str, object]:

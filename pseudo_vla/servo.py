@@ -134,7 +134,7 @@ class ArmServo:
         if self.trajectory is None or self.trajectory.finished:
             return None
         waypoint = self.trajectory.positions[self.trajectory.index]
-        self.trajectory.index += 1
+        self.trajectory.index += 2
         return {
             name: float(value)
             for name, value in zip(self.trajectory.joint_names, waypoint)
