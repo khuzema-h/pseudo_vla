@@ -19,6 +19,9 @@ GOAL_TOLERANCE = 0.005
 KINEMATICS_TOLERANCE = 0.02
 # Match block collision boxes to their actual dimensions so the 10 cm hover pose clears them.
 OBSTACLE_PADDING = 0.0
+GRIPPER_TRACK_MIN_POINTS = 4
+GRIPPER_TRACK_LOSS_DISTANCE = 0.10
+GRIPPER_TRACK_LOSS_FRAMES = 2
 
 
 @dataclass
@@ -30,6 +33,83 @@ class ActiveTrajectory:
     @property
     def finished(self) -> bool:
         return self.index >= len(self.positions)
+
+
+class GripperRelativeObjectTracker:
+    """Check whether tracked object points remain at their grasp-time offset from the hand."""
+
+    def __init__(
+        self,
+        max_relative_drift: float = GRIPPER_TRACK_LOSS_DISTANCE,
+        lost_frames: int = GRIPPER_TRACK_LOSS_FRAMES,
+        min_points: int = GRIPPER_TRACK_MIN_POINTS,
+    ) -> None:
+        self.max_relative_drift = float(max_relative_drift)
+        self.lost_frames_required = int(lost_frames)
+        self.min_points = int(min_points)
+        self.relative_position: np.ndarray | None = None
+        self.last_observation_id: int | None = None
+        self._lost_frames = 0
+        self.last_drift: float | None = None
+
+    def seed(
+        self,
+        hand_position: np.ndarray,
+        object_points: np.ndarray,
+        observation_id: int | None = None,
+    ) -> bool:
+        points = self._valid_points(object_points)
+        if len(points) < self.min_points:
+            return False
+        hand = np.asarray(hand_position, dtype=np.float64).reshape(3)
+        self.relative_position = np.median(points, axis=0) - hand
+        self.last_observation_id = observation_id
+        self._lost_frames = 0
+        self.last_drift = 0.0
+        return True
+
+    def update(
+        self,
+        hand_position: np.ndarray,
+        object_points: np.ndarray,
+        observation_id: int | None = None,
+    ) -> bool | None:
+        if self.relative_position is None:
+            return None
+        if observation_id is not None:
+            if observation_id == self.last_observation_id:
+                return None
+            self.last_observation_id = observation_id
+
+        points = self._valid_points(object_points)
+        if len(points) < self.min_points:
+            return None
+
+        hand = np.asarray(hand_position, dtype=np.float64).reshape(3)
+        relative_position = np.median(points, axis=0) - hand
+        self.last_drift = float(np.linalg.norm(relative_position - self.relative_position))
+        if self.last_drift > self.max_relative_drift:
+            self._lost_frames += 1
+            return False if self._lost_frames >= self.lost_frames_required else None
+        self._lost_frames = 0
+        return True
+
+    def clear(self) -> None:
+        self.relative_position = None
+        self.last_observation_id = None
+        self._lost_frames = 0
+        self.last_drift = None
+
+    @property
+    def lost(self) -> bool:
+        return self._lost_frames >= self.lost_frames_required
+
+    @staticmethod
+    def _valid_points(points: np.ndarray) -> np.ndarray:
+        array = np.asarray(points, dtype=np.float64)
+        if array.ndim != 2 or array.shape[1] != 3:
+            raise ValueError("Tracked object points must be an Nx3 array")
+        return array[np.all(np.isfinite(array), axis=1)]
 
 
 class ArmServo:
@@ -54,6 +134,7 @@ class ArmServo:
         self.trajectory: ActiveTrajectory | None = None
         self.goal: ApproachGoal | None = None
         self.home_goal: ApproachGoal | None = None
+        self.gripper_object_tracker = GripperRelativeObjectTracker()
 
     def check_kinematics(self, joint_map: dict[str, float], usd_hand_base: np.ndarray) -> None:
         state = self._joint_state(joint_map)

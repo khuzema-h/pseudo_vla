@@ -62,6 +62,7 @@ class Perception:
         self.query_xy: np.ndarray | None = None
         self.tracks_xy: np.ndarray | None = None
         self.tracks_visible: np.ndarray | None = None
+        self.tracking_generation = 0
         self.group_masks: dict[str, np.ndarray] = {}
         self.grounder = ObjectGrounder()
         self.grounder.load()
@@ -224,6 +225,35 @@ class Perception:
         }
         self._seed_tracker(image, group_points)
 
+    def add_group_from_box(
+        self,
+        rgb: np.ndarray,
+        name: str,
+        box: tuple[float, float, float, float],
+        count_per_group: int = 16,
+        tracks_xy: np.ndarray | None = None,
+    ) -> None:
+        """Add a segmented track group while reseeding existing groups at their latest positions."""
+        if name in self.query_groups:
+            raise ValueError(f"CoTracker query group {name!r} already exists")
+        if self.query_xy is None or self.tracks_xy is None:
+            raise RuntimeError("CoTracker must be initialized before adding a group")
+
+        image = np.ascontiguousarray(rgb[..., :3])
+        if image.dtype != np.uint8:
+            image = np.clip(image, 0, 255).astype(np.uint8)
+        mask = self.segment_region(image, box=box)
+        current_tracks = self.tracks_xy if tracks_xy is None else np.asarray(tracks_xy)
+        if current_tracks.shape != self.query_xy.shape:
+            raise ValueError("Current tracks must match the existing CoTracker query points")
+        group_points = {
+            group_name: current_tracks[span].copy()
+            for group_name, span in self.query_groups.items()
+        }
+        group_points[name] = sample_mask_points(mask, count=count_per_group)
+        self.group_masks[name] = mask
+        self._seed_tracker(image, group_points)
+
     def _seed_tracker(self, image: np.ndarray, group_points: dict[str, np.ndarray]) -> None:
         query_groups: dict[str, slice] = {}
         query_chunks = []
@@ -247,6 +277,7 @@ class Perception:
         self.queries = torch.from_numpy(queries).unsqueeze(0).cuda()
         self.tracks_xy = self.query_xy.copy()
         self.tracks_visible = np.ones(len(self.query_xy), dtype=bool)
+        self.tracking_generation = getattr(self, "tracking_generation", 0) + 1
         self.tracker(
             video_chunk=_rgb_tensor(image),
             is_first_step=True,
@@ -285,6 +316,7 @@ class Perception:
             if tracks is not None:
                 self.tracks_xy = tracks[0, -1].detach().cpu().numpy()
                 self.tracks_visible = visible[0, -1].detach().cpu().numpy().astype(bool)
+                self.tracking_generation = getattr(self, "tracking_generation", 0) + 1
         return self.latest_tracks()
 
     def approach_goal(

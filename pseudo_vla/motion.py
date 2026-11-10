@@ -55,6 +55,7 @@ def execute_pose(
     log,
     view,
     release_when_supported: bool = False,
+    tracking_check=None,
 ) -> tuple[bool, str | None]:
     servo.clear()
     servo.update_goal(goal, scene.joint_positions())
@@ -83,8 +84,15 @@ def execute_pose(
         command = servo.command()
         if command:
             scene.set_joint_targets(command)
-        rgb, depth, _ = scene.read_sensors()
+        rgb, depth, camera_params = scene.read_sensors()
         update_tracker(scene, perception, rgb, depth, view)
+        if tracking_check is not None and tracking_check(
+            scene, perception, servo, depth, camera_params
+        ) is False:
+            log("CoTracker points moved away from the gripper; stopping pose motion")
+            servo.clear()
+            scene.set_joint_targets(scene.joint_positions())
+            return False, None
         if float(np.linalg.norm(servo.hand_position(scene.joint_positions()) - goal.position)) <= APPROACH_TOLERANCE:
             return True, None
         if servo.trajectory is None or (release_when_supported and servo.trajectory.finished):

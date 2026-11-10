@@ -381,12 +381,14 @@ def _dispatch_stage_request(
         is_prereq = step in prereqs
         if is_prereq:
             say(f"prerequisite: executing {step} first")
+        previous_stage = state.stage
 
         if step == "approach":
             ok = _stage_approach(
                 scene, perception, servo, target_name, commands, max_steps, say, log, view, state
             )
             if not ok:
+                state.record_transition(step, target_name, previous_stage, status="failed")
                 say(f"stage approach failed for {target_name}")
                 return None
         elif step == "grasp":
@@ -394,6 +396,7 @@ def _dispatch_stage_request(
                 scene, perception, servo, target_name, commands, max_steps, say, log, view, state
             )
             if not ok:
+                state.record_transition(step, target_name, previous_stage, status="failed")
                 say(f"stage grasp failed for {target_name}")
                 return None
         elif step == "lift":
@@ -401,6 +404,7 @@ def _dispatch_stage_request(
                 scene, perception, servo, target_name, commands, max_steps, say, log, view, state
             )
             if not ok:
+                state.record_transition(step, target_name, previous_stage, status="failed")
                 say(f"stage lift failed for {target_name}")
                 return None
         elif step == "place":
@@ -408,6 +412,9 @@ def _dispatch_stage_request(
                 scene, perception, servo, target_name, request.destination, commands, max_steps, say, log, view, state
             )
             if not ok:
+                state.record_transition(
+                    step, target_name, previous_stage, request.destination, status="failed"
+                )
                 say("stage place failed")
                 return None
         elif step == "release":
@@ -415,13 +422,21 @@ def _dispatch_stage_request(
                 scene, perception, servo, commands, max_steps, say, log, view, state
             )
             if not ok:
+                state.record_transition(step, target_name, previous_stage, status="failed")
                 say("stage release failed")
                 return None
         elif step == "retreat":
             ok = _stage_retreat(scene, servo, commands, max_steps, log, view, state)
             if not ok:
+                state.record_transition(step, target_name, previous_stage, status="failed")
                 say("stage retreat failed")
                 return None
+        state.record_transition(
+            step,
+            target_name,
+            previous_stage,
+            request.destination if step == request.stage else None,
+        )
 
     say(f"stage {request.stage} complete")
     return None
@@ -676,6 +691,7 @@ def _stage_approach(
             "moving_spec": moving_spec,
             "moving_dims": moving_dims,
             "moving_item": moving_item,
+            "known_objects": dict(_observed(scene)),
             "grasp_style": grasp_style,
             "hover_goal": hover_goal,
             "grasp_goal": grasp_goal,
@@ -715,6 +731,7 @@ def _stage_grasp(
     if pending is not None:
         return False
 
+    _seed_gripper_object_tracking(scene, perception, servo, say)
     state.stage = "grasped"
     state.held_object = moving_name
     return True
@@ -732,14 +749,96 @@ def _stage_lift(
     lift_height = ctx["lift_height"]
 
     say(f"lifting {moving_name} by {lift_height:.2f} m")
-    reached, pending = _execute_pose(scene, servo, lift_goal, perception, commands, max_steps, log, view)
+    reached, pending = _execute_pose(
+        scene,
+        servo,
+        lift_goal,
+        perception,
+        commands,
+        max_steps,
+        log,
+        view,
+        tracking_check=_check_gripper_object_tracking,
+    )
     if pending is not None or not reached:
+        tracker = getattr(servo, "gripper_object_tracker", None)
+        if tracker is not None and tracker.lost:
+            say(f"CoTracker points moved away from the gripper; {moving_name} is no longer held")
+            state.reset()
+            return False
         say(f"could not lift {moving_name}")
         return False
 
     state.stage = "lifted"
     state.held_object = moving_name
     return True
+
+
+def _seed_gripper_object_tracking(scene, perception, servo, say) -> bool:
+    from pseudo_vla.perception import prim_world_pose
+
+    tracker = getattr(servo, "gripper_object_tracker", None)
+    if tracker is None:
+        return False
+    rgb, depth, camera_params = scene.read_sensors()
+    tracked = perception.push_frame(rgb)
+    if tracked is None:
+        tracked = perception.latest_tracks()
+    if tracked is None:
+        say("CoTracker has no object points to check the grasp")
+        tracker.clear()
+        return False
+
+    tracks_xy, visible = tracked
+    object_points = _gripper_tracking_points(
+        perception, tracks_xy, visible, depth, camera_params, scene.camera_path
+    )
+    hand_world, _ = prim_world_pose(scene.hand_path)
+    generation = getattr(perception, "tracking_generation", None)
+    seeded = tracker.seed(hand_world, object_points, generation)
+    if seeded:
+        say(
+            f"CoTracker grasp reference set from {len(object_points)} points; "
+            "checking object motion relative to the gripper"
+        )
+    else:
+        say("CoTracker has too few valid depth points to check the grasp")
+        tracker.clear()
+    return seeded
+
+
+def _check_gripper_object_tracking(scene, perception, servo, depth, camera_params):
+    from pseudo_vla.perception import prim_world_pose
+
+    tracker = getattr(servo, "gripper_object_tracker", None)
+    if tracker is None:
+        return None
+    if tracker.relative_position is None:
+        return None
+    tracks = perception.latest_tracks()
+    if tracks is None:
+        return None
+
+    tracks_xy, visible = tracks
+    object_points = _gripper_tracking_points(
+        perception, tracks_xy, visible, depth, camera_params, scene.camera_path
+    )
+    hand_world, _ = prim_world_pose(scene.hand_path)
+    generation = getattr(perception, "tracking_generation", None)
+    return tracker.update(hand_world, object_points, generation)
+
+
+def _gripper_tracking_points(perception, tracks_xy, visible, depth, camera_params, camera_path):
+    groups = getattr(perception, "query_groups", {}) or {}
+    if groups and "moving" not in groups:
+        return np.zeros((0, 3), dtype=np.float64)
+    if "moving" in groups:
+        return perception.tracked_group_points(
+            "moving", tracks_xy, visible, depth, camera_params, camera_path
+        )
+    from pseudo_vla.geometry import unproject_tracks
+
+    return unproject_tracks(tracks_xy, visible, depth, camera_params, camera_path)
 
 
 def _stage_place(
@@ -762,14 +861,60 @@ def _stage_place(
     target_name = None if destination.kind == "at" else destination.target
     support_spec = specs.get(target_name) if target_name is not None else None
 
-    # Track support if needed
-    if target_name is not None and "support" not in getattr(perception, "query_groups", {}):
+    support_observation = None
+    fallback_support_points = None
+    groups = getattr(perception, "query_groups", {}) or {}
+
+    # The support may be occluded after lifting; retain its last measured pose and box.
+    if target_name is not None:
+        support_observation = (
+            _observed(scene).get(target_name)
+            or (ctx.get("known_objects", {}).get(target_name) if isinstance(ctx.get("known_objects"), dict) else None)
+        )
+    if target_name is not None and "support" not in groups:
         scene.step()
         rgb, depth, camera_params = scene.read_sensors()
         measured = _measure_frame(perception, rgb, depth, camera_params, scene.camera_path, say)
+        _store_observed(scene, measured)
+        support_observation = measured.get(target_name) or support_observation
         if target_name in measured:
-            perception.segment_groups(rgb, {"support": (None, measured[target_name].box)})
-            perception.release_sam()
+            known_objects = ctx.get("known_objects")
+            if isinstance(known_objects, dict):
+                known_objects.update(measured)
+            moving_tracks = perception.push_frame(rgb)
+            if (
+                "moving" in getattr(perception, "query_groups", {})
+                and hasattr(perception, "add_group_from_box")
+            ):
+                perception.add_group_from_box(
+                    rgb,
+                    "support",
+                    support_observation.box,
+                    tracks_xy=None if moving_tracks is None else moving_tracks[0],
+                )
+                perception.release_sam()
+            elif not getattr(perception, "query_groups", {}):
+                perception.segment_groups(rgb, {"support": (None, support_observation.box)})
+                perception.release_sam()
+            else:
+                say(f"using the remembered {target_name} pose; no support CoTracker group is available")
+        elif support_observation is not None:
+            say(f"environment camera could not find {target_name}; using its remembered pose")
+
+    groups = getattr(perception, "query_groups", {}) or {}
+    if "moving" not in groups:
+        say(f"continuing with stored grasp context for {moving_name}; no moving CoTracker group is active")
+
+    if support_observation is not None:
+        fallback_support_points = _support_points_from_observation(support_observation)
+    if (
+        destination.kind == "on"
+        and target_name is not None
+        and "support" not in (getattr(perception, "query_groups", {}) or {})
+        and fallback_support_points is None
+    ):
+        say(f"cannot place on {target_name}: no current or remembered support pose is available")
+        return False
 
     destination_label = destination.kind
     if destination.target:
@@ -787,25 +932,43 @@ def _stage_place(
         scene.step()
         rgb, depth, camera_params = scene.read_sensors()
         tracked = perception.push_frame(rgb)
+        tracking_status = _check_gripper_object_tracking(
+            scene, perception, servo, depth, camera_params
+        )
+        if tracking_status is False:
+            say(f"CoTracker points moved away from the gripper; {moving_name} is no longer held")
+            servo.clear()
+            scene.set_joint_targets(scene.joint_positions())
+            state.reset()
+            return False
         tracks_xy = None
         visible = None
         if tracked is not None:
             tracks_xy, visible = tracked
-        if destination.kind == "on" and tracks_xy is not None:
-            support_points = perception.tracked_group_points(
-                "support", tracks_xy, visible, depth, camera_params, scene.camera_path
+        support_points = (
+            _tracked_support_points(
+                perception,
+                tracks_xy,
+                visible,
+                depth,
+                camera_params,
+                scene.camera_path,
+                fallback_support_points,
             )
-            if support_points.shape[0] >= 4:
-                if grasp_style == "side":
-                    preplace_goal, place_goal = _side_placement_goals(
-                        support_points, grasp_world, moving_item.center_world, TABLE_TOP_Z, grasp_goal.quaternion, scene.base_path,
-                        clearance=_placement_clearance(support_spec),
-                    )
-                else:
-                    preplace_goal, place_goal = _stack_placement_goals(
-                        support_points, moving_dims, scene.base_path, clearance=_placement_clearance(support_spec),
-                    )
-                servo.update_goal(preplace_goal, scene.joint_positions())
+            if destination.kind == "on"
+            else np.empty((0, 3), dtype=np.float64)
+        )
+        if destination.kind == "on" and support_points.shape[0] >= 4:
+            if grasp_style == "side":
+                preplace_goal, place_goal = _side_placement_goals(
+                    support_points, grasp_world, moving_item.center_world, TABLE_TOP_Z, grasp_goal.quaternion, scene.base_path,
+                    clearance=_placement_clearance(support_spec),
+                )
+            else:
+                preplace_goal, place_goal = _stack_placement_goals(
+                    support_points, moving_dims, scene.base_path, clearance=_placement_clearance(support_spec),
+                )
+            servo.update_goal(preplace_goal, scene.joint_positions())
         elif destination.kind != "on":
             preplace_goal, place_goal = _relative_placement_goals(scene, moving_name, destination, scene.base_path)
             servo.update_goal(preplace_goal, scene.joint_positions())
@@ -833,10 +996,18 @@ def _stage_place(
         reached, pending = _execute_pose(
             scene, servo, place_goal, perception, commands, max_steps, log, view,
             release_when_supported=grasp_style == "side",
+            tracking_check=_check_gripper_object_tracking,
         )
         if pending is not None or not reached:
+            tracker = getattr(servo, "gripper_object_tracker", None)
+            if tracker is not None and tracker.lost:
+                say(f"CoTracker points moved away from the gripper; {moving_name} is no longer held")
+                state.reset()
             return False
         scene.set_gripper_closed(False)
+        tracker = getattr(servo, "gripper_object_tracker", None)
+        if tracker is not None:
+            tracker.clear()
         _settle_tracker(scene, perception, GRIPPER_SETTLE_STEPS, view)
     finally:
         if destination.kind == "on" and support_spec is not None:
@@ -852,6 +1023,46 @@ def _stage_place(
     say(f"placed {moving_name} at {destination_label}")
     state.reset()
     return True
+
+
+def _tracked_support_points(
+    perception, tracks_xy, visible, depth, camera_params, camera_path, fallback_points
+) -> np.ndarray:
+    groups = getattr(perception, "query_groups", {}) or {}
+    if tracks_xy is not None and "support" in groups:
+        points = perception.tracked_group_points(
+            "support", tracks_xy, visible, depth, camera_params, camera_path
+        )
+        if points.shape[0] >= 4 or fallback_points is None:
+            return points
+    if fallback_points is not None:
+        return fallback_points
+    return np.empty((0, 3), dtype=np.float64)
+
+
+def _support_points_from_observation(observation) -> np.ndarray | None:
+    center = np.asarray(observation.center_world, dtype=np.float64)
+    dims = np.asarray(observation.dims, dtype=np.float64)
+    top_z = float(observation.top_z)
+    if (
+        center.shape != (3,)
+        or dims.shape != (3,)
+        or not np.all(np.isfinite(center))
+        or not np.all(np.isfinite(dims))
+        or not np.isfinite(top_z)
+        or np.any(dims <= 0)
+    ):
+        return None
+    half_x, half_y = dims[0] * 0.25, dims[1] * 0.25
+    return np.array(
+        [
+            [center[0] - half_x, center[1] - half_y, top_z],
+            [center[0] - half_x, center[1] + half_y, top_z],
+            [center[0] + half_x, center[1] - half_y, top_z],
+            [center[0] + half_x, center[1] + half_y, top_z],
+        ],
+        dtype=np.float64,
+    )
 
 
 def _stage_release(scene, perception, servo, commands, max_steps, say, log, view, state) -> bool:
@@ -888,6 +1099,9 @@ def _stage_release(scene, perception, servo, commands, max_steps, say, log, view
     if support is None:
         say(f"no collision surface below {held_name}; releasing in place")
         _open_gripper_for_next_command(scene, perception, say, view)
+        tracker = getattr(servo, "gripper_object_tracker", None)
+        if tracker is not None:
+            tracker.clear()
         _finish_release_state(state)
         _record_released_object(
             servo, scene, context["moving_spec"], object_center, moving_dims, enable=True
@@ -925,11 +1139,23 @@ def _stage_release(scene, perception, servo, commands, max_steps, say, log, view
     try:
         say(f"moving {held_name} above the nearest surface ({support_name})")
         reached, pending = _execute_pose(
-            scene, servo, hover_goal, perception, commands, max_steps, log, view
+            scene,
+            servo,
+            hover_goal,
+            perception,
+            commands,
+            max_steps,
+            log,
+            view,
+            tracking_check=_check_gripper_object_tracking,
         )
         if pending is not None:
             commands.put(pending)
         if pending is not None or not reached:
+            tracker = getattr(servo, "gripper_object_tracker", None)
+            if tracker is not None and tracker.lost:
+                say(f"CoTracker points moved away from the gripper; {held_name} is no longer held")
+                state.reset()
             return False
 
         say(f"lowering {held_name} to the release height")
@@ -943,13 +1169,21 @@ def _stage_release(scene, perception, servo, commands, max_steps, say, log, view
             log,
             view,
             release_when_supported=True,
+            tracking_check=_check_gripper_object_tracking,
         )
         if pending is not None:
             commands.put(pending)
         if pending is not None or not reached:
+            tracker = getattr(servo, "gripper_object_tracker", None)
+            if tracker is not None and tracker.lost:
+                say(f"CoTracker points moved away from the gripper; {held_name} is no longer held")
+                state.reset()
             return False
 
         _open_gripper_for_next_command(scene, perception, say, view)
+        tracker = getattr(servo, "gripper_object_tracker", None)
+        if tracker is not None:
+            tracker.clear()
         _finish_release_state(state)
         released = True
 
@@ -1302,6 +1536,7 @@ def _grasp_and_lift(scene, servo, spec, hover_goal, perception, commands, max_st
         incoming = _close_gripper_in_place(scene, perception, commands, view)
         if incoming:
             return incoming
+        _seed_gripper_object_tracking(scene, perception, servo, say)
 
         lift_world = grasp_world.copy()
         lift_world[2] += LIFT_HEIGHT
@@ -1313,10 +1548,24 @@ def _grasp_and_lift(scene, servo, spec, hover_goal, perception, commands, max_st
             top_z=float(hover_goal.top_z),
         )
         say(f"lifting {spec['name']} by {LIFT_HEIGHT:.2f} m")
-        reached, pending = _execute_pose(scene, servo, lift_goal, perception, commands, max_steps, log, view)
+        reached, pending = _execute_pose(
+            scene,
+            servo,
+            lift_goal,
+            perception,
+            commands,
+            max_steps,
+            log,
+            view,
+            tracking_check=_check_gripper_object_tracking,
+        )
         if pending is not None:
             return pending
         if not reached:
+            tracker = getattr(servo, "gripper_object_tracker", None)
+            if tracker is not None and tracker.lost:
+                say(f"CoTracker points moved away from the gripper; {spec['name']} is no longer held")
+                return None
             say(f"could not plan the lift for {spec['name']}")
             return None
 
@@ -1777,6 +2026,7 @@ def _stack_tracked_cube(
             say(f"pick-and-place interrupted by {pending}")
             commands.put(pending)
             return False
+        _seed_gripper_object_tracking(scene, perception, servo, say)
         if authorize_event is not None:
             authorize_event("grasp", completed=True)
 
@@ -1794,11 +2044,23 @@ def _stack_tracked_cube(
         if authorize_event is not None and not authorize_event("lift"):
             return False
         say(f"lifting {moving_name} by {lift_height:.2f} m")
-        reached, pending = _execute_pose(scene, servo, lift_goal, perception, commands, max_steps, log, view)
+        reached, pending = _execute_pose(
+            scene,
+            servo,
+            lift_goal,
+            perception,
+            commands,
+            max_steps,
+            log,
+            view,
+            tracking_check=_check_gripper_object_tracking,
+        )
         if pending is not None or not reached:
             if pending is not None:
                 say(f"pick-and-place interrupted by {pending}")
                 commands.put(pending)
+            elif getattr(servo, "gripper_object_tracker", None) is not None and servo.gripper_object_tracker.lost:
+                say(f"CoTracker points moved away from the gripper; {moving_name} is no longer held")
             else:
                 say(f"could not lift {moving_name}")
             return False
@@ -1819,6 +2081,14 @@ def _stack_tracked_cube(
             scene.step()
             rgb, depth, camera_params = scene.read_sensors()
             tracked = perception.push_frame(rgb)
+            tracking_status = _check_gripper_object_tracking(
+                scene, perception, servo, depth, camera_params
+            )
+            if tracking_status is False:
+                say(f"CoTracker points moved away from the gripper; {moving_name} is no longer held")
+                servo.clear()
+                scene.set_joint_targets(scene.joint_positions())
+                return False
             tracks_xy = None
             visible = None
             if tracked is not None:
@@ -1915,15 +2185,21 @@ def _stack_tracked_cube(
                 log,
                 view,
                 release_when_supported=grasp_style == "side",
+                tracking_check=_check_gripper_object_tracking,
             )
             if pending is not None or not reached:
                 if pending is not None:
                     say(f"pick-and-place interrupted by {pending}")
                     commands.put(pending)
+                elif servo.gripper_object_tracker.lost:
+                    say(f"CoTracker points moved away from the gripper; {moving_name} is no longer held")
                 else:
                     say(f"could not place {moving_name} at {destination_label}")
                 return False
             scene.set_gripper_closed(False)
+            tracker = getattr(servo, "gripper_object_tracker", None)
+            if tracker is not None:
+                tracker.clear()
             _settle_tracker(scene, perception, GRIPPER_SETTLE_STEPS, view)
             if authorize_event is not None:
                 authorize_event("place", completed=True)

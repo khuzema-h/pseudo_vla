@@ -66,6 +66,38 @@ def _complete_action_with_callbacks(*args):
 
 
 class StackingPerceptionTests(unittest.TestCase):
+    def test_remembered_support_pose_produces_surface_points(self):
+        observation = SimpleNamespace(
+            center_world=np.array([0.2, -0.1, 0.4]),
+            dims=np.array([0.4, 0.2, 0.1]),
+            top_z=0.45,
+        )
+
+        points = track_and_servo._support_points_from_observation(observation)
+
+        np.testing.assert_allclose(
+            points,
+            [
+                [0.1, -0.15, 0.45],
+                [0.1, -0.05, 0.45],
+                [0.3, -0.15, 0.45],
+                [0.3, -0.05, 0.45],
+            ],
+        )
+
+    def test_missing_support_group_uses_fallback_without_tracking_call(self):
+        fallback = np.ones((4, 3), dtype=np.float64)
+        instance = SimpleNamespace(
+            query_groups={},
+            tracked_group_points=lambda *args: self.fail("missing group must not be queried"),
+        )
+
+        points = track_and_servo._tracked_support_points(
+            instance, np.zeros((4, 2)), np.ones(4, dtype=bool), None, {}, "", fallback
+        )
+
+        np.testing.assert_array_equal(points, fallback)
+
     def test_grouped_segmentation_seeds_one_tracker_with_group_slices(self):
         instance = perception.Perception.__new__(perception.Perception)
         instance.sam = _FakeSam()
@@ -186,6 +218,41 @@ class StackingPerceptionTests(unittest.TestCase):
         np.testing.assert_array_equal(instance.query_xy[:4], support_points)
         np.testing.assert_array_equal(instance.query_xy[4:], grasp_points)
         self.assertEqual(instance.query_groups["moving"], slice(4, 8))
+        self.assertTrue(np.all(instance.mask[4:28, 4:28]))
+        self.assertTrue(np.all(instance.mask[36:60, 36:60]))
+
+    def test_add_group_from_box_keeps_moving_tracks_and_adds_support(self):
+        instance = perception.Perception.__new__(perception.Perception)
+        instance.sam = _FakeSam()
+        instance.tracker = _FakeTracker()
+        instance.frames = []
+        instance.queries = None
+        instance.query_groups = {}
+        instance._window_start = 0
+        instance.mask = None
+        instance.query_xy = None
+        instance.tracks_xy = None
+        instance.tracks_visible = None
+        instance.group_masks = {}
+        instance._ensure_sam = lambda: None
+        image = np.zeros((64, 64, 3), dtype=np.uint8)
+
+        with patch.object(perception.torch.Tensor, "cuda", lambda tensor: tensor):
+            instance.segment_groups(
+                image, {"moving": (None, (36, 36, 60, 60))}, count_per_group=4
+            )
+            latest_moving = instance.query_xy + np.array([1.0, 0.0], dtype=np.float32)
+            instance.add_group_from_box(
+                image,
+                "support",
+                (4, 4, 28, 28),
+                count_per_group=4,
+                tracks_xy=latest_moving,
+            )
+
+        np.testing.assert_array_equal(instance.query_xy[:4], latest_moving)
+        self.assertEqual(instance.query_groups["moving"], slice(0, 4))
+        self.assertEqual(instance.query_groups["support"], slice(4, 8))
         self.assertTrue(np.all(instance.mask[4:28, 4:28]))
         self.assertTrue(np.all(instance.mask[36:60, 36:60]))
 

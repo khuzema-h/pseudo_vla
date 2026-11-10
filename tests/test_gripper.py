@@ -1,11 +1,139 @@
 import unittest
 from queue import Queue
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
+from pseudo_vla import controller
 from pseudo_vla.motion import close_gripper_in_place
+from pseudo_vla.motion import execute_pose
 from pseudo_vla.scene import FINGER_GRIP_EFFORT, FINGER_GRIP_STIFFNESS, strengthen_finger_grip
+from pseudo_vla.servo import GripperRelativeObjectTracker
+
+
+class GripperRelativeObjectTrackerTests(unittest.TestCase):
+    def test_tracks_object_motion_relative_to_hand(self):
+        tracker = GripperRelativeObjectTracker(max_relative_drift=0.05, lost_frames=2)
+        hand = np.array([0.0, 0.0, 0.3])
+        object_points = np.array(
+            [
+                [0.01, 0.0, 0.3],
+                [0.02, 0.0, 0.3],
+                [0.01, 0.01, 0.3],
+                [0.02, 0.01, 0.3],
+            ]
+        )
+
+        self.assertTrue(tracker.seed(hand, object_points, observation_id=1))
+        self.assertTrue(tracker.update(hand + [0.0, 0.0, 0.1], object_points + [0.0, 0.0, 0.1], 2))
+        self.assertIsNone(tracker.update(hand + [0.0, 0.0, 0.2], object_points + [0.0, 0.0, 0.2], 2))
+
+    def test_reports_lost_only_after_repeated_relative_drift(self):
+        tracker = GripperRelativeObjectTracker(max_relative_drift=0.05, lost_frames=2)
+        object_points = np.array(
+            [
+                [0.01, 0.0, 0.3],
+                [0.02, 0.0, 0.3],
+                [0.01, 0.01, 0.3],
+                [0.02, 0.01, 0.3],
+            ]
+        )
+        self.assertTrue(tracker.seed(np.array([0.0, 0.0, 0.3]), object_points))
+
+        self.assertIsNone(tracker.update(np.array([0.0, 0.0, 0.4]), object_points))
+        self.assertFalse(tracker.lost)
+        self.assertFalse(tracker.update(np.array([0.0, 0.0, 0.5]), object_points))
+        self.assertTrue(tracker.lost)
+        self.assertTrue(tracker.update(np.array([0.0, 0.0, 0.5]), object_points + [0.0, 0.0, 0.2]))
+        self.assertFalse(tracker.lost)
+
+    def test_execute_pose_stops_when_gripper_tracking_reports_loss(self):
+        class _Servo:
+            trajectory = object()
+
+            def clear(self):
+                self.trajectory = None
+
+            def update_goal(self, *_args):
+                self.trajectory = object()
+
+            def command(self):
+                return None
+
+            def hand_position(self, _joints):
+                return np.array([0.0, 0.0, 0.0])
+
+        targets = []
+        scene = SimpleNamespace(
+            joint_positions=lambda: {},
+            step=lambda: None,
+            read_sensors=lambda: (np.zeros((2, 2, 3), dtype=np.uint8), np.ones((2, 2)), {}),
+            set_joint_targets=lambda joints: targets.append(joints),
+        )
+        servo = _Servo()
+        result = execute_pose(
+            scene,
+            servo,
+            SimpleNamespace(position=np.array([1.0, 0.0, 0.0])),
+            SimpleNamespace(push_frame=lambda _rgb: None),
+            Queue(),
+            2,
+            lambda _message: None,
+            None,
+            tracking_check=lambda *_args: False,
+        )
+
+        self.assertEqual(result, (False, None))
+        self.assertIsNone(servo.trajectory)
+        self.assertEqual(targets, [{}])
+
+    def test_controller_checks_tracked_points_against_the_current_hand_pose(self):
+        tracker = GripperRelativeObjectTracker(max_relative_drift=0.05, lost_frames=2)
+        servo = SimpleNamespace(gripper_object_tracker=tracker)
+        object_points = np.array(
+            [
+                [0.01, 0.0, 0.3],
+                [0.02, 0.0, 0.3],
+                [0.01, 0.01, 0.3],
+                [0.02, 0.01, 0.3],
+            ]
+        )
+        scene = SimpleNamespace(
+            hand_path="/World/hand",
+            camera_path="/World/camera",
+            read_sensors=lambda: (np.zeros((2, 2, 3), dtype=np.uint8), np.ones((2, 2)), {}),
+        )
+        hand_position = np.array([0.0, 0.0, 0.3])
+        perception = SimpleNamespace(
+            query_groups={"moving": slice(0, 4)},
+            tracking_generation=1,
+            push_frame=lambda _rgb: (np.zeros((4, 2)), np.ones(4, dtype=bool)),
+            latest_tracks=lambda: (np.zeros((4, 2)), np.ones(4, dtype=bool)),
+            tracked_group_points=lambda *_args: object_points.copy(),
+        )
+
+        with patch(
+            "pseudo_vla.perception.prim_world_pose",
+            side_effect=lambda _path: (
+                hand_position.copy(),
+                np.array([1.0, 0.0, 0.0, 0.0]),
+            ),
+        ):
+            self.assertTrue(controller._seed_gripper_object_tracking(scene, perception, servo, lambda _: None))
+            hand_position[2] += 0.1
+            perception.tracking_generation = 2
+            self.assertIsNone(
+                controller._check_gripper_object_tracking(
+                    scene, perception, servo, np.ones((2, 2)), {}
+                )
+            )
+            perception.tracking_generation = 3
+            self.assertFalse(
+                controller._check_gripper_object_tracking(
+                    scene, perception, servo, np.ones((2, 2)), {}
+                )
+            )
 
 
 class CloseGripperTests(unittest.TestCase):

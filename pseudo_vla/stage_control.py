@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Mapping
-
 from pseudo_vla.task_plan import Destination
 
 
@@ -18,17 +16,59 @@ class StageRequest:
 
 
 class ControllerStageState:
+    HISTORY_LIMIT = 100
+
     def __init__(self) -> None:
         self.held_object: str | None = None
         self.stage: str = "home"  # "home", "approached", "grasped", "lifted", "placed", "released"
         self.target_object: str | None = None
         self.context: dict[str, object] | None = None
+        self.history: list[dict[str, object]] = []
 
     def reset(self) -> None:
         self.held_object = None
         self.stage = "home"
         self.target_object = None
         self.context = None
+
+    def record_transition(
+        self,
+        stage: str,
+        object_id: str | None,
+        previous_stage: str,
+        destination: Destination | None = None,
+        status: str = "complete",
+    ) -> None:
+        context = self.context or {}
+        moving_item = context.get("moving_item")
+        known_objects = context.get("known_objects", {})
+        self.history.append(
+            {
+                "stage": stage,
+                "object_id": object_id,
+                "destination": None
+                if destination is None
+                else {"kind": destination.kind, "target": destination.target},
+                "status": status,
+                "stage_before": previous_stage,
+                "stage_after": self.stage,
+                "held_object": self.held_object,
+                "moving_center_world": _vector_snapshot(
+                    getattr(moving_item, "center_world", None)
+                ),
+                "known_objects": tuple(known_objects) if isinstance(known_objects, dict) else (),
+            }
+        )
+        del self.history[:-self.HISTORY_LIMIT]
+
+
+def _vector_snapshot(value) -> list[float] | None:
+    if value is None:
+        return None
+    try:
+        return [float(component) for component in value]
+    except (TypeError, ValueError):
+        return None
 
 
 def parse_stage_instruction(

@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 from pseudo_vla.stage_control import (
     ControllerStageState,
@@ -198,6 +199,26 @@ class StageControlTests(unittest.TestCase):
         req = StageRequest(stage="approach", object_id="plate")
         prereqs, error = plan_stage_prerequisites(req, state)
         self.assertIn("already held", error)
+
+    def test_stage_history_preserves_transition_context_across_reset(self):
+        state = ControllerStageState()
+        state.stage = "lifted"
+        state.held_object = "mug"
+        state.context = {
+            "moving_item": SimpleNamespace(center_world=[0.1, 0.2, 0.3]),
+            "known_objects": {"plate": object()},
+        }
+
+        state.record_transition("lift", "mug", "grasped")
+        state.reset()
+
+        self.assertEqual(len(state.history), 1)
+        transition = state.history[0]
+        self.assertEqual(transition["stage_before"], "grasped")
+        self.assertEqual(transition["stage_after"], "lifted")
+        self.assertEqual(transition["held_object"], "mug")
+        self.assertEqual(transition["moving_center_world"], [0.1, 0.2, 0.3])
+        self.assertEqual(transition["known_objects"], ("plate",))
 
 
 if __name__ == "__main__":
